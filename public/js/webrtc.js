@@ -983,9 +983,13 @@ export class WebRTCManager {
     const pc = await this.createConnection(peerId);
     const isPolite = this._isPolite(peerId);
 
-    // Perfect Negotiation: check for offer collision
-    const offerCollision = this.makingOffer.get(peerId) ||
-      (pc.signalingState !== 'stable' && pc.signalingState !== 'have-local-offer');
+    // Perfect Negotiation: check for offer collision.
+    // 必须把 have-local-offer 也算作碰撞：预热对双端都会触发（addPeer → prewarm），
+    // 两端几乎同时 createOffer，双方都会停在 have-local-offer。此时若判定为"无碰撞"，
+    // 双方都会 rollback 并互相应答对方的 offer，导致各自的 local(answer)/remote(offer)
+    // 不配对、DTLS 角色同为 active → 握手冲突，P2P 必然失败退回中继。
+    // 正确行为：不礼貌的一方忽略收到的 offer，只有礼貌的一方回滚并应答。
+    const offerCollision = this.makingOffer.get(peerId) || pc.signalingState !== 'stable';
 
     this.ignoreOffer.set(peerId, !isPolite && offerCollision);
 
@@ -2778,6 +2782,19 @@ export class WebRTCManager {
    * Silent P2P connection attempt (for prewarming)
    */
   async _attemptP2PConnectionSilent(peerId) {
+    // 对方可能已经先握手完成（本端是被动应答方，数据通道由对方在 offer 里带来）。
+    // 此时绝不能再 createDataChannel + createOffer：那会在同一次握手里插入一次
+    // 多余的重协商，并在两端各多出一条同名的数据通道。只等通道和密钥就绪即可。
+    const existing = this.dataChannels.get(peerId);
+    if (existing && (existing.readyState === 'open' || existing.readyState === 'connecting')) {
+      debugLog(`[WebRTC] Prewarm: peer ${peerId} already negotiated, waiting for channel`);
+      await Promise.all([
+        this.waitForChannel(peerId, CONNECTION_TIMEOUT),
+        this.waitForEncryptionKey(peerId, CONNECTION_TIMEOUT)
+      ]);
+      return;
+    }
+
     this.makingOffer.set(peerId, true);
 
     try {
