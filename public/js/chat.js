@@ -364,6 +364,28 @@ export const ChatMixin = {
     }
   },
 
+  /**
+   * data:URL 转 Blob —— 不能用 fetch(dataUrl)：
+   * CSP connect-src 'self' 会拦截 data: 请求（线上实测 Failed to fetch），
+   * 而复制图片恰恰只在生产部署后才触发这条路径。手工解 base64 即可。
+   */
+  dataUrlToBlob(dataUrl) {
+    const commaIdx = dataUrl.indexOf(',');
+    if (commaIdx < 0) throw new Error('invalid data url');
+    const meta = dataUrl.slice(0, commaIdx); // data:image/png;base64
+    const payload = dataUrl.slice(commaIdx + 1);
+    const match = /^data:([^;,]*)/.exec(meta);
+    const mime = (match && match[1]) || 'image/png';
+
+    if (meta.includes(';base64')) {
+      const binary = atob(payload);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return new Blob([bytes], { type: mime });
+    }
+    return new Blob([decodeURIComponent(payload)], { type: mime });
+  },
+
   async copyImageToClipboard(dataUrl, btn) {
     try {
       // Check if browser supports clipboard write
@@ -372,9 +394,8 @@ export const ChatMixin = {
         return;
       }
 
-      // Convert data URL to Blob
-      const response = await fetch(dataUrl);
-      const blob = await response.blob();
+      // Convert data URL to Blob（手工解码，不走 fetch —— CSP 禁止 data: fetch）
+      const blob = this.dataUrlToBlob(dataUrl);
 
       // Copy as image
       const item = new ClipboardItem({
