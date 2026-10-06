@@ -341,8 +341,10 @@ export class WebRTCManager {
     // Pre-fetch ICE servers eagerly
     fetchIceServers();
 
-    // 清理上次会话中断残留的落盘分块（配额防满）
-    chunkStore.pruneAll().catch(() => {});
+    // 回收上次会话中断残留的落盘分块（配额防满）。
+    // 只删过期残留、不整库清空：IndexedDB 同源共享，整库清会连带抹掉
+    // 其他标签页正在接收的分块。函数内部保证每次页面加载只扫一次。
+    chunkStore.pruneStale().catch(() => {});
 
     // Track peers for prewarming
     this.knownPeers = new Set();
