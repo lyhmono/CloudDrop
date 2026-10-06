@@ -536,7 +536,20 @@ class CloudDrop {
     // If no room param, let server assign room based on IP
     const params = new URLSearchParams(location.search);
     const roomParam = params.get('room');
-    this.roomCode = roomParam ? roomParam.toUpperCase() : null; // Normalize to uppercase
+    if (roomParam && !ROOM.CODE_PATTERN.test(roomParam)) {
+      // 格式非法时不能静默换房：服务端 /ws 也用同一个正则校验，非法值会被它
+      // 回落到"按 IP 分配"的房间，用户会莫名进到另一个房间却毫无提示。
+      // 这里显式告知并按自动分配处理（房间号一律 6 位字母数字）。
+      debugLog(`[App] 忽略非法房间号参数: ${roomParam}`);
+      ui.showToast(i18n.t('room.invalidCode'), 'error');
+      this.roomCode = null;
+      // 顺手把废参数从地址栏摘掉：既免得刷新时重复提示，也免得把无效链接分享出去
+      const cleanUrl = new URL(location.href);
+      cleanUrl.searchParams.delete('room');
+      history.replaceState({}, '', cleanUrl.toString());
+    } else {
+      this.roomCode = roomParam ? roomParam.toUpperCase() : null; // Normalize to uppercase
+    }
 
     // If joining a specific room, check if it requires password
     if (this.roomCode) {
