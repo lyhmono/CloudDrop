@@ -147,13 +147,14 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
 async function handleIceServers(request: Request, env: Env): Promise<Response> {
   // Default STUN-only configuration (fallback if TURN not configured)
   // Prioritize China-accessible servers, with global fallbacks
+  // 注意：不要加 stun.syncthing.net —— 该域名解析到 192.0.2.42（RFC 5737 文档
+  // 保留段，不可路由），加了只会白占客户端的健康检查位并刷 ICE 报错。
   const defaultIceServers = [
     // China-accessible STUN servers (prioritized)
     { urls: 'stun:stun.miwifi.com:3478' },      // Xiaomi - China
     { urls: 'stun:stun.yy.com:3478' },          // YY - China
     // Global STUN servers
     { urls: 'stun:stun.cloudflare.com:3478' },  // Cloudflare
-    { urls: 'stun:stun.syncthing.net:3478' },   // Syncthing
     { urls: 'stun:stun.nextcloud.com:3478' },   // Nextcloud
   ];
 
