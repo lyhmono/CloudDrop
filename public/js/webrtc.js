@@ -875,20 +875,33 @@ export class WebRTCManager {
 
   /**
    * Flush pending ICE candidates for a peer
+   *
+   * addIceCandidate 要求 remoteDescription 已就绪，否则会抛
+   * "The remote description was null"。createConnection 里新建 pc 后立刻调用本
+   * 函数就正是这种情况（此时缓冲的是对方早到的候选，例如 prewarm 的 300-600ms
+   * 延迟窗口里到达的 host 候选）。所以未就绪时保留缓冲、等 handleOffer /
+   * handleAnswer 设置完 remoteDescription 后再冲刷——原先无条件冲刷会在失败后
+   * 把缓冲删掉，那批候选就永久丢失了。
    */
   async _flushPendingCandidates(peerId, pc) {
     const pending = this.pendingCandidates.get(peerId);
-    if (pending && pending.length > 0) {
-      debugLog(`[WebRTC] Flushing ${pending.length} pending ICE candidates for ${peerId}`);
-      for (const candidate of pending) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (e) {
-          console.warn(`[WebRTC] Failed to add buffered candidate: ${e.message}`);
-        }
-      }
-      this.pendingCandidates.delete(peerId);
+    if (!pending || pending.length === 0) return;
+
+    if (!pc.remoteDescription || !pc.remoteDescription.type) {
+      debugLog(`[WebRTC] Deferring ${pending.length} pending ICE candidates for ${peerId} (no remote desc yet)`);
+      return;
     }
+
+    debugLog(`[WebRTC] Flushing ${pending.length} pending ICE candidates for ${peerId}`);
+    for (const candidate of pending) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        // 单个候选被拒不影响其余候选（真正无效的候选没有重试价值）
+        console.warn(`[WebRTC] Failed to add buffered candidate: ${e.message}`);
+      }
+    }
+    this.pendingCandidates.delete(peerId);
   }
 
   // Setup data channel

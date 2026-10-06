@@ -1,15 +1,19 @@
 /**
- * CloudDrop - WebRTC 协商回归测试
+ * CloudDrop - WebRTC 协商 / 信令回归测试
  *
- * 覆盖「双端同时发起 offer」这个最常见的碰撞场景：
- * 预热对双端都会触发（addPeer → prewarmConnection），两端几乎同时 createOffer，
- * 双方都会停在 have-local-offer 等对方应答。
+ * 覆盖两类曾经出问题、且 CI 抓不到的信令状态机行为：
  *
- * 关键状态：本端的 offer 已经发出（makingOffer 已复位为 false），
- * signalingState 停在 'have-local-offer'。此时收到对方的 offer 即为碰撞。
- * 正确行为是「不礼貌的一方忽略、礼貌的一方回滚并应答」，恰好一方回滚。
- * 若判定逻辑漏掉 have-local-offer，双方都会回滚并互相应答对方的 offer，
- * 各自的 local(answer)/remote(offer) 不配对、DTLS 角色同为 active，P2P 必然失败。
+ * 1) 「双端同时发起 offer」的碰撞
+ *    预热对双端都会触发（addPeer → prewarmConnection），两端几乎同时 createOffer，
+ *    双方都会停在 have-local-offer 等对方应答。正确行为是「不礼貌的一方忽略、
+ *    礼貌的一方回滚并应答」，恰好一方回滚；若判定漏掉 have-local-offer，双方都会
+ *    回滚并互相应答，各自的 local(answer)/remote(offer) 不配对、DTLS 角色同为
+ *    active，P2P 必然失败。
+ *
+ * 2) 早到的 ICE 候选被过早冲刷而丢弃
+ *    addIceCandidate 要求 remoteDescription 已就绪。createConnection 新建 pc 后
+ *    立刻冲刷时 remoteDescription 必为 null，此时必须保留缓冲、等 remoteDescription
+ *    就绪后再冲刷，否则那批候选（常是 host 候选）会被永久丢掉。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,8 +21,8 @@ import assert from 'node:assert/strict';
 import { WebRTCManager } from '../public/js/webrtc.js';
 import { cryptoManager } from '../public/js/crypto.js';
 
-// Node 没有 WebRTC 全局对象。handleOffer 只用 RTCSessionDescription 把
-// { type, sdp } 包一层，这里补个等价替身即可（其余方法由 FakePc 提供）。
+// Node 没有 WebRTC 全局对象。这里只补两个把普通对象包一层的等价替身，
+// 其余行为由 FakePc 提供。
 if (typeof globalThis.RTCSessionDescription === 'undefined') {
   globalThis.RTCSessionDescription = class RTCSessionDescription {
     constructor(init = {}) {
@@ -28,7 +32,15 @@ if (typeof globalThis.RTCSessionDescription === 'undefined') {
   };
 }
 
-/** 最小 RTCPeerConnection 替身：只实现 handleOffer 路径用到的状态机 */
+if (typeof globalThis.RTCIceCandidate === 'undefined') {
+  globalThis.RTCIceCandidate = class RTCIceCandidate {
+    constructor(init = {}) {
+      Object.assign(this, init);
+    }
+  };
+}
+
+/** 最小 RTCPeerConnection 替身：只实现 handleOffer / 候选冲刷路径用到的状态机 */
 class FakePc {
   constructor(signalingState = 'stable') {
     this.signalingState = signalingState;
@@ -38,6 +50,7 @@ class FakePc {
     this.rollbackCount = 0;
     this.answerCount = 0;
     this.dataChannelCount = 0;
+    this.addedCandidates = [];
   }
 
   async setLocalDescription(desc) {
@@ -55,6 +68,16 @@ class FakePc {
   async setRemoteDescription(desc) {
     this.remoteDescription = desc;
     this.signalingState = 'have-remote-offer';
+  }
+
+  /** 与浏览器一致：remoteDescription 为 null 时直接抛错 */
+  async addIceCandidate(candidate) {
+    if (!this.remoteDescription) {
+      throw new Error(
+        "Failed to execute 'addIceCandidate' on 'RTCPeerConnection': The remote description was null"
+      );
+    }
+    this.addedCandidates.push(candidate);
   }
 
   async createAnswer() {
@@ -148,4 +171,36 @@ test('预冷启动：对方已先握手时不再重复创建通道与 offer', as
   assert.equal(pc.dataChannelCount, 0, '不应再创建数据通道');
   assert.equal(pc.answerCount, 0, '不应再生成 answer');
   assert.equal(sent.filter((m) => m.type === 'offer').length, 0, '不应再发起自己的 offer');
+});
+
+test('缓冲候选：remoteDescription 未就绪时不得冲刷，候选必须保留', async () => {
+  const { manager, pc, remotePeerId } = makePeerWaitingForAnswer('peer-a', 'peer-b');
+  const buffered = [{ candidate: 'candidate:1' }, { candidate: 'candidate:2' }];
+  manager.pendingCandidates.set(remotePeerId, [...buffered]);
+
+  // createConnection 新建 pc 后立刻冲刷的场景：此时 remoteDescription 必为 null
+  await manager._flushPendingCandidates(remotePeerId, pc);
+
+  assert.equal(pc.addedCandidates.length, 0, '未就绪时不得调用 addIceCandidate');
+  assert.deepEqual(
+    manager.pendingCandidates.get(remotePeerId),
+    buffered,
+    '候选必须原样保留在缓冲里，不能被丢弃'
+  );
+});
+
+test('缓冲候选：remoteDescription 就绪后冲刷成功并清空缓冲', async () => {
+  const { manager, pc, remotePeerId } = makePeerWaitingForAnswer('peer-a', 'peer-b');
+  manager.pendingCandidates.set(remotePeerId, [{ candidate: 'candidate:1' }, { candidate: 'candidate:2' }]);
+
+  // 第一次（过早）冲刷：保留缓冲
+  await manager._flushPendingCandidates(remotePeerId, pc);
+  assert.equal(pc.addedCandidates.length, 0);
+
+  // 模拟 handleAnswer / handleOffer 设置完 remoteDescription 后再冲刷
+  pc.remoteDescription = { type: 'answer', sdp: 'v=0' };
+  await manager._flushPendingCandidates(remotePeerId, pc);
+
+  assert.equal(pc.addedCandidates.length, 2, '两个候选都应被加入');
+  assert.equal(manager.pendingCandidates.has(remotePeerId), false, '冲刷成功后应清空缓冲');
 });
