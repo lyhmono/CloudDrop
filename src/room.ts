@@ -187,8 +187,9 @@ export class Room {
     await this.state.storage.put('passwordHash', body.passwordHash);
     await this.state.storage.setAlarm(Date.now() + Room.SECURE_ROOM_TTL);
 
-    ws.send(JSON.stringify({ type: 'set-password-result', success: true }));
-
+    // 撤权先于回执：设密者的连接可能在上面 storage.put 的 await 期间断开，
+    // 若把 ws.send 排在前头，它抛错会（此前版本）直接吞掉后面的广播与关闭循环，
+    // 旧成员保持 isAuthenticated 继续用已加密房间的信令。
     // 通知房间内其他设备：房间已被加密，需要密码重新加入
     this.broadcast({ type: 'room-locked', data: {} }, attachment.id);
 
@@ -202,6 +203,9 @@ export class Room {
         // 忽略关闭失败
       }
     }
+
+    // 回执设密者；断线也不能影响已完成密码设置与撤权
+    this.safeSend(ws, JSON.stringify({ type: 'set-password-result', success: true }));
   }
 
   private handleWebSocket(request: Request): Response {
@@ -332,7 +336,7 @@ export class Room {
         
         if (!isAuthenticated) {
           if (msg.type === 'auth') {
-             await this.handleAuth(ws, msg, attachment);
+             await this.handleAuth(ws, msg);
              return;
           }
           
@@ -395,25 +399,25 @@ export class Room {
 
   /**
    * 递增某网段桶的认证失败计数（清理过期条目，防存储无限增长）
+   * 注意：调用方（handleAuth）已处于 blockConcurrencyWhile 串行区内；
+   * blockConcurrencyWhile 不可嵌套，这里不得再包一层。
    */
   private async incrementBucketAuthFailures(bucket: string): Promise<void> {
-    await this.state.blockConcurrencyWhile(async () => {
-      const all = await this.state.storage.get<Record<string, { count: number; windowStart: number }>>('authFailuresByBucket') || {};
-      const now = Date.now();
+    const all = await this.state.storage.get<Record<string, { count: number; windowStart: number }>>('authFailuresByBucket') || {};
+    const now = Date.now();
 
-      for (const k of Object.keys(all)) {
-        if (now - all[k].windowStart >= Room.AUTH_FAILURE_WINDOW) {
-          delete all[k];
-        }
+    for (const k of Object.keys(all)) {
+      if (now - all[k].windowStart >= Room.AUTH_FAILURE_WINDOW) {
+        delete all[k];
       }
+    }
 
-      const entry = all[bucket] || { count: 0, windowStart: now };
-      // 窗口起点只在过期重建时更新，失败只累加计数（防永久锁房 DoS）
-      entry.count += 1;
-      all[bucket] = entry;
+    const entry = all[bucket] || { count: 0, windowStart: now };
+    // 窗口起点只在过期重建时更新，失败只累加计数（防永久锁房 DoS）
+    entry.count += 1;
+    all[bucket] = entry;
 
-      await this.state.storage.put('authFailuresByBucket', all);
-    });
+    await this.state.storage.put('authFailuresByBucket', all);
   }
 
   /**
@@ -492,114 +496,144 @@ export class Room {
   }
 
   /**
+   * Send a frame, tolerating a connection that is already closing
+   */
+  private safeSend(ws: WebSocket, payload: string): void {
+    try {
+      ws.send(payload);
+    } catch (e) {
+      // Connection may be closing - ignore
+    }
+  }
+
+  /**
    * Handle authentication request with brute-force protection
    */
-  private async handleAuth(ws: WebSocket, msg: SignalingMessage, currentAttachment: PeerAttachment | null): Promise<void> {
-    // Check per-connection attempts
-    const attempts = currentAttachment?.authAttempts || 0;
-    if (attempts >= Room.MAX_PASSWORD_ATTEMPTS) {
-      this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', '尝试次数过多，请重新连接');
-      ws.close(4002, 'RATE_LIMIT_EXCEEDED');
-      return;
-    }
+  private async handleAuth(ws: WebSocket, msg: SignalingMessage): Promise<void> {
+    // 整个"检查限流 → 验证 → 写回计数"必须串行执行。DO 在 await 处会让出事件循环，
+    // 并发 auth 消息若各自先读旧计数、验证后才写回，per-connection / 全局 / 网段桶
+    // 三层限流都会被流水绕过（两条同时都以 attempts=0 起跑，写回互相覆盖）。
+    // digest 是纯内存计算，串行化没有性能代价。
+    await this.state.blockConcurrencyWhile(async () => {
+      // 排队期间计数可能已被前一条 auth 更新，必须重新读取而不是用消息到达时的快照
+      const attachment = ws.deserializeAttachment() as PeerAttachment | null;
 
-    // Global room-level brute-force protection (survives reconnects - the
-    // per-connection counter alone is trivially bypassed by reconnecting)
-    const now = Date.now();
-    const storedFailures = await this.state.storage.get<{ count: number; windowStart: number }>('authFailures');
-    const failures = storedFailures && (now - storedFailures.windowStart) < Room.AUTH_FAILURE_WINDOW
-      ? storedFailures
-      : { count: 0, windowStart: now };
-
-    if (failures.count >= Room.MAX_ROOM_AUTH_FAILURES) {
-      this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', '尝试次数过多，请稍后再试');
-      ws.close(4002, 'RATE_LIMIT_EXCEEDED');
-      return;
-    }
-
-    // Per-network-bucket brute-force protection（CF-Connecting-IP 网段桶，
-    // 换连接/换 IPv6 临时地址都无法绕过；分布式换网段由全局计数兑底）
-    const clientBucket = currentAttachment?.clientBucket || '';
-    if (clientBucket) {
-      const bucketFailures = await this.getBucketAuthFailures(clientBucket);
-      if (bucketFailures.count >= Room.MAX_IP_AUTH_FAILURES) {
-        this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', '尝试次数过多，请稍后再试');
-        ws.close(4002, 'RATE_LIMIT_EXCEEDED');
+      // Check per-connection attempts
+      const attempts = attachment?.authAttempts || 0;
+      if (attempts >= Room.MAX_PASSWORD_ATTEMPTS) {
+        this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', '尝试次数过多，请重新连接');
+        try { ws.close(4002, 'RATE_LIMIT_EXCEEDED'); } catch (e) { /* ignore */ }
         return;
       }
-    }
 
-    const authData = msg.data as { response: string };
-    const expectedNonce = currentAttachment?.authChallenge;
+      // Global room-level brute-force protection (survives reconnects - the
+      // per-connection counter alone is trivially bypassed by reconnecting)
+      const now = Date.now();
+      const storedFailures = await this.state.storage.get<{ count: number; windowStart: number }>('authFailures');
+      const failures = storedFailures && (now - storedFailures.windowStart) < Room.AUTH_FAILURE_WINDOW
+        ? storedFailures
+        : { count: 0, windowStart: now };
 
-    if (!expectedNonce || !this.passwordHash) {
-       ws.close(4002, 'AUTH_ERROR');
-       return;
-    }
-
-    // Verify response = SHA256(passwordHash + nonce)
-    const encoder = new TextEncoder();
-    const data = encoder.encode(this.passwordHash + expectedNonce);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    const expectedResponse = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-    
-    if (authData && authData.response === expectedResponse) {
-      // Authentication successful
-      
-      // Reset global failure counter
-      await this.state.storage.delete('authFailures');
-
-      // Reset per-bucket failure counter
-      if (currentAttachment?.clientBucket) {
-        await this.clearBucketAuthFailures(currentAttachment.clientBucket);
+      if (failures.count >= Room.MAX_ROOM_AUTH_FAILURES) {
+        this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', '尝试次数过多，请稍后再试');
+        try { ws.close(4002, 'RATE_LIMIT_EXCEEDED'); } catch (e) { /* ignore */ }
+        return;
       }
 
-      // Clear challenge and set authenticated
-      ws.serializeAttachment({
-        ...currentAttachment,
-        isAuthenticated: true,
-        authChallenge: undefined,
-        authAttempts: 0
-      });
-      
-      // Now that we have a verified user, we can clear the inactivity alarm
-      await this.state.storage.deleteAlarm();
-
-      ws.send(JSON.stringify({
-        type: 'auth-success'
-      }));
-    } else {
-      // Authentication failed - increment attempts
-      const newAttempts = attempts + 1;
-      const newNonce = crypto.randomUUID();
-
-      // 失败窗口：只在窗口过期时重置起点；失败只累加计数。
-      // （若每次失败都重置 windowStart，攻击者每 9 分钟失败一次即可永久锁房）
-      failures.count += 1;
-      await this.state.storage.put('authFailures', failures);
-
-      // Increment per-bucket failure counter
-      if (currentAttachment?.clientBucket) {
-        await this.incrementBucketAuthFailures(currentAttachment.clientBucket);
+      // Per-network-bucket brute-force protection（CF-Connecting-IP 网段桶，
+      // 换连接/换 IPv6 临时地址都无法绕过；分布式换网段由全局计数兑底）
+      const clientBucket = attachment?.clientBucket || '';
+      if (clientBucket) {
+        const bucketFailures = await this.getBucketAuthFailures(clientBucket);
+        if (bucketFailures.count >= Room.MAX_IP_AUTH_FAILURES) {
+          this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', '尝试次数过多，请稍后再试');
+          try { ws.close(4002, 'RATE_LIMIT_EXCEEDED'); } catch (e) { /* ignore */ }
+          return;
+        }
       }
 
-      ws.serializeAttachment({
-        ...currentAttachment,
-        authChallenge: newNonce,
-        authAttempts: newAttempts
-      });
+      const authData = msg.data as { response: string };
+      const expectedNonce = attachment?.authChallenge;
 
-      ws.send(JSON.stringify({
-        type: 'error',
-        error: 'PASSWORD_INCORRECT',
-        message: '密码错误',
-        data: { nonce: newNonce } // Send new nonce for retry
-      }));
-      
-      // If max attempts reached, close
-      if (newAttempts >= Room.MAX_PASSWORD_ATTEMPTS) {
-        ws.close(4002, 'RATE_LIMIT_EXCEEDED');
+      if (!expectedNonce || !this.passwordHash) {
+        try { ws.close(4002, 'AUTH_ERROR'); } catch (e) { /* ignore */ }
+        return;
+      }
+
+      // Verify response = SHA256(passwordHash + nonce)
+      const encoder = new TextEncoder();
+      const data = encoder.encode(this.passwordHash + expectedNonce);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const expectedResponse = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+      if (authData && authData.response === expectedResponse) {
+        // Authentication successful
+
+        // Reset global failure counter
+        await this.state.storage.delete('authFailures');
+
+        // Reset per-bucket failure counter
+        if (clientBucket) {
+          await this.clearBucketAuthFailures(clientBucket);
+        }
+
+        // Clear challenge and set authenticated
+        ws.serializeAttachment({
+          ...attachment,
+          isAuthenticated: true,
+          authChallenge: undefined,
+          authAttempts: 0
+        });
+
+        // Now that we have a verified user, we can clear the inactivity alarm
+        await this.state.storage.deleteAlarm();
+
+        this.safeSend(ws, JSON.stringify({ type: 'auth-success' }));
+      } else {
+        // Authentication failed - increment attempts
+        const newAttempts = attempts + 1;
+        const newNonce = crypto.randomUUID();
+
+        // 失败窗口：只在窗口过期时重置起点；失败只累加计数。
+        // （若每次失败都重置 windowStart，攻击者每 9 分钟失败一次即可永久锁房）
+        failures.count += 1;
+        await this.state.storage.put('authFailures', failures);
+
+        // Increment per-bucket failure counter
+        if (clientBucket) {
+          await this.incrementBucketAuthFailures(clientBucket);
+        }
+
+        ws.serializeAttachment({
+          ...attachment,
+          authChallenge: newNonce,
+          authAttempts: newAttempts
+        });
+
+        this.safeSend(ws, JSON.stringify({
+          type: 'error',
+          error: 'PASSWORD_INCORRECT',
+          message: '密码错误',
+          data: { nonce: newNonce } // Send new nonce for retry
+        }));
+
+        // If max attempts reached, close
+        if (newAttempts >= Room.MAX_PASSWORD_ATTEMPTS) {
+          try { ws.close(4002, 'RATE_LIMIT_EXCEEDED'); } catch (e) { /* ignore */ }
+        }
+      }
+    });
+  }
+
+  /**
+   * 剔除该连接在 peerWsCache 中的条目（close/error 共用）
+   */
+  private prunePeerCacheEntry(ws: WebSocket): void {
+    if (this.peerWsCache) {
+      const attachment = ws.deserializeAttachment() as PeerAttachment | null;
+      if (attachment?.id && this.peerWsCache.get(attachment.id) === ws) {
+        this.peerWsCache.delete(attachment.id);
       }
     }
   }
@@ -613,12 +647,7 @@ export class Room {
     this.relayDropWarn.delete(ws);
 
     // Prune the cache entry for this connection
-    if (this.peerWsCache) {
-      const attachment = ws.deserializeAttachment() as PeerAttachment | null;
-      if (attachment?.id && this.peerWsCache.get(attachment.id) === ws) {
-        this.peerWsCache.delete(attachment.id);
-      }
-    }
+    this.prunePeerCacheEntry(ws);
 
     await this.handleLeave(ws);
   }
@@ -632,6 +661,11 @@ export class Room {
     this.messageRateLimits.delete(ws);
     this.relayByteBudget.delete(ws);
     this.relayDropWarn.delete(ws);
+
+    // 与 close 对称：error-only 断线同样要清缓存，否则失效 WS 一直留在
+    // peerWsCache 里被广播遍历（休眠重建前不会消失）
+    this.prunePeerCacheEntry(ws);
+
     await this.handleLeave(ws);
   }
 
