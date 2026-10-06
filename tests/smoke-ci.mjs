@@ -3,7 +3,7 @@
  * 启动 wrangler dev → 验证首页 200 + 安全头 + WebSocket 能完成 join。
  * （真实浏览器渲染/CSP 字体等仍建议本地 playwright 复核）
  */
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -78,6 +78,9 @@ const wrangler = spawn(npxCommand, ['wrangler', 'dev', '--port', String(PORT)], 
   cwd: fileURLToPath(new URL('..', import.meta.url)),
   stdio: ['ignore', 'pipe', 'pipe'],
   detached: true, // 独立进程组，便于连子进程一起清理
+  // Windows 上 .cmd 不能直接 spawn（Node ≥18.20 出于安全考虑要求经 shell），
+  // 否则本地 npm run smoke 直接 EINVAL 退出。Linux CI 保持原样。
+  shell: process.platform === 'win32',
 });
 
 let wranglerOutput = '';
@@ -85,17 +88,29 @@ wrangler.stdout.on('data', (d) => { wranglerOutput += d.toString(); });
 wrangler.stderr.on('data', (d) => { wranglerOutput += d.toString(); });
 wrangler.on('error', (error) => { wranglerOutput += `${error.stack || error}\n`; });
 
+/** 收掉 wrangler 进程树（Windows 不支持按进程组发信号，得用 taskkill /T） */
+function killWranglerTree() {
+  if (process.platform === 'win32') {
+    // process.kill(-pid) 在 Windows 上会 ESRCH，只能靠 taskkill 连子进程一起收
+    try {
+      spawnSync('taskkill', ['/pid', String(wrangler.pid), '/T', '/F'], { stdio: 'ignore' });
+    } catch (e) { /* already gone */ }
+    return;
+  }
+  try { process.kill(-wrangler.pid, 'SIGTERM'); } catch (e) { /* already gone */ }
+}
+
 async function stopWrangler() {
   const hasExited = () => wrangler.exitCode !== null || wrangler.signalCode !== null;
   if (hasExited()) return;
 
   const gracefulExit = once(wrangler, 'exit');
-  try { process.kill(-wrangler.pid, 'SIGTERM'); } catch (e) { /* already gone */ }
+  killWranglerTree();
   await Promise.race([gracefulExit, sleep(3000)]);
 
   if (!hasExited()) {
     const forcedExit = once(wrangler, 'exit');
-    try { process.kill(-wrangler.pid, 'SIGKILL'); } catch (e) { /* already gone */ }
+    killWranglerTree();
     await Promise.race([forcedExit, sleep(1000)]);
   }
 }
