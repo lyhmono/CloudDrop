@@ -15,33 +15,55 @@ export interface Env {
 }
 
 // =============================================================================
-// ICE servers (TURN credentials) caching + per-IP rate limiting
+// Per-IP window rate limiting (shared by ICE credentials and room checks)
 // Each unique client previously triggered a fresh Cloudflare TURN API call -
 // expensive and abusable. Cache at module scope and throttle by IP.
 // =============================================================================
 let cachedIceServers: { iceServers: unknown[]; expiresAt: number } | null = null;
 
-const iceServersRequestLimits = new Map<string, { count: number; resetAt: number }>();
+interface RateWindow { count: number; resetAt: number }
+const iceServersRequestLimits = new Map<string, RateWindow>();
+const checkPasswordRequestLimits = new Map<string, RateWindow>();
 const ICE_SERVERS_MAX_PER_IP = 10;         // 10 requests
-const ICE_SERVERS_WINDOW_MS = 60 * 1000;   // per minute, per IP
+const CHECK_PASSWORD_MAX_PER_IP = 30;      // 30 requests
+const RATE_WINDOW_MS = 60 * 1000;          // per minute, per IP
 
-function isIceServersRateLimited(ip: string): boolean {
+function isIpRateLimited(store: Map<string, RateWindow>, ip: string, maxPerIp: number): boolean {
   const now = Date.now();
-  let entry = iceServersRequestLimits.get(ip);
+  let entry = store.get(ip);
 
   if (!entry || now > entry.resetAt) {
     // Map 只增不删会无限增长：超过阈值时顺带清理过期条目
-    if (iceServersRequestLimits.size > 500) {
-      for (const [k, v] of iceServersRequestLimits) {
-        if (now > v.resetAt) iceServersRequestLimits.delete(k);
+    if (store.size > 500) {
+      for (const [k, v] of store) {
+        if (now > v.resetAt) store.delete(k);
       }
     }
-    iceServersRequestLimits.set(ip, { count: 1, resetAt: now + ICE_SERVERS_WINDOW_MS });
+    store.set(ip, { count: 1, resetAt: now + RATE_WINDOW_MS });
     return false;
   }
 
   entry.count++;
-  return entry.count > ICE_SERVERS_MAX_PER_IP;
+  return entry.count > maxPerIp;
+}
+
+// =============================================================================
+// Same-origin gate for WebSocket upgrades
+// WebSocket 不受同源策略约束：任何网页都能在「访问过 CloudDrop 的用户」浏览器里
+// 直接 new WebSocket 连进来。自动分配房间按客户端 IP（/24、/64）哈希分房，
+// 这类跨站连接的源 IP 恰好就是受害者本人——恶意页面因此能枚举其同网段房间里的
+// 设备名/浏览器信息、注入信令，甚至在房间内待满 3 秒后设置密码把原成员踢出。
+// 浏览器发起的 WS/请求必带 Origin；curl、ws 库等非浏览器客户端不带（无法伪造），
+// 保持放行以兼容 API 调用与冒烟测试。
+// =============================================================================
+function isTrustedOrigin(request: Request): boolean {
+  const origin = request.headers.get('Origin');
+  if (!origin) return true;
+  try {
+    return new URL(origin).origin === new URL(request.url).origin;
+  } catch (e) {
+    return false;
+  }
 }
 
 const SECURITY_HEADERS: Record<string, string> = {
@@ -71,11 +93,25 @@ export default {
     // Handle WebSocket upgrade requests
     // 注意：101 升级响应不能经 withSecurityHeaders 重建（会破坏 WebSocket 配对）
     if (url.pathname === '/ws') {
+      // 跨站 WS 门禁：浏览器发起的升级必带 Origin，非同源直接拒绝
+      // （自动分配房间按源 IP 分房，跨站连接会命中受害者本人房间，详见 isTrustedOrigin）
+      if (!isTrustedOrigin(request)) {
+        return new Response('Forbidden: cross-origin WebSocket', {
+          status: 403,
+          headers: { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' },
+        });
+      }
       return handleWebSocket(request, env);
     }
 
     // Handle room password APIs
     if (url.pathname === '/api/room/check-password') {
+      if (!isTrustedOrigin(request)) {
+        return withSecurityHeaders(new Response(JSON.stringify({ success: false, error: 'Forbidden' }), {
+          status: 403,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
       return withSecurityHeaders(await handleCheckRoomPassword(request, env));
     }
 
@@ -164,7 +200,7 @@ async function handleIceServers(request: Request, env: Env): Promise<Response> {
   if (env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN) {
     // Throttle by IP so TURN credentials can't be scraped for bandwidth abuse
     const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
-    if (isIceServersRateLimited(clientIP)) {
+    if (isIpRateLimited(iceServersRequestLimits, clientIP, ICE_SERVERS_MAX_PER_IP)) {
       return new Response(JSON.stringify({ error: 'Too many requests' }), {
         status: 429,
         headers: jsonHeaders,
@@ -288,6 +324,16 @@ export function expandIPv6(ip: string): string {
 async function handleCheckRoomPassword(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const roomParam = url.searchParams.get('room');
+
+  // 限流：该端点每次合法请求都会激活一个 Room DO（读 storage），
+  // 不设限可被用来批量探测房间码/刷 DO 读写成本
+  const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
+  if (isIpRateLimited(checkPasswordRequestLimits, clientIP, CHECK_PASSWORD_MAX_PER_IP)) {
+    return new Response(JSON.stringify({ success: false, error: 'Too many requests' }), {
+      status: 429,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
 
   if (!roomParam || !/^[a-zA-Z0-9]{6}$/.test(roomParam)) {
     return new Response(JSON.stringify({

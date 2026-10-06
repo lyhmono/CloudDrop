@@ -146,11 +146,26 @@ try {
   console.log('WebSocket joined:', joined.roomCode === room);
   ws.close();
 
+  // 4. 跨站 WS 门禁：带外部 Origin 的升级必须被拒绝（不带 Origin 的 CLI 连接已在
+  //    上一步验证放行）。回归会导致恶意网页可枚举/劫持用户的自动分配房间。
+  const crossOrigin = new WebSocket(`ws://localhost:${PORT}/ws?room=${room}`, {
+    headers: { Origin: 'https://evil.example.com' },
+  });
+  const gate = await new Promise((resolve) => {
+    const t = setTimeout(() => { crossOrigin.terminate(); resolve('timeout'); }, 5000);
+    crossOrigin.on('open', () => { clearTimeout(t); crossOrigin.close(); resolve('accepted'); });
+    crossOrigin.on('unexpected-response', (_req, res) => { clearTimeout(t); resolve(res.statusCode); });
+    crossOrigin.on('error', () => { clearTimeout(t); resolve('error'); });
+  });
+  console.log('跨站 Origin 升级返回:', gate);
+  ws = null;
+
   const failed = [
     ...checks.filter(([, ok]) => !ok).map(([f]) => `资源 ${f} 非 200`),
     ...(!fontOk ? ['CSP 缺 gstatic.loli.net'] : []),
     ...(!nosniff ? ['缺 nosniff'] : []),
     ...(joined.roomCode !== room ? ['WebSocket join 失败'] : []),
+    ...(gate !== 403 ? [`跨站 WS 未被拦截（得到 ${gate}，期望 403）`] : []),
   ];
 
   if (failed.length) {
