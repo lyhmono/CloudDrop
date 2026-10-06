@@ -144,6 +144,26 @@ try {
   ws.send(JSON.stringify({ type: 'join', data: { name: 'smoke', deviceType: 'desktop', deviceKey: 'SMK' } }));
   const joined = await joinedPromise;
   console.log('WebSocket joined:', joined.roomCode === room);
+
+  // 3.5 心跳链路：客户端每 20s 发 'ping'，依赖 DO 的 setWebSocketAutoResponse 回
+  // 'pong'。此路径是移动端半死连接自愈的前提，回归会让接收方永远收不到文件提示。
+  // 用独立连接复刻 app 时序（join 后隔一会儿再 ping），避免复用上面带 joined
+  // 监听器的连接；autoResponse 在 handleJoin 内配置，ping 需在其之后。
+  const hb = new WebSocket(`ws://localhost:${PORT}/ws?room=${room}`);
+  await waitWsOpen(hb);
+  hb.send(JSON.stringify({ type: 'join', data: { name: 'hb', deviceType: 'desktop', deviceKey: 'HB' } }));
+  await waitWsMessage(hb, 'joined');
+  await sleep(1500);
+  const pongOk = await new Promise((resolve) => {
+    const t = setTimeout(() => resolve(false), 5000);
+    // 注意：Node 风格 'message' 回调第一个参数直接是 data（Buffer），不是 event 对象
+    hb.on('message', (data) => {
+      if (String(data) === 'pong') { clearTimeout(t); resolve(true); }
+    });
+    hb.send('ping');
+  });
+  hb.close();
+  console.log('心跳 ping→pong 自动应答:', pongOk);
   ws.close();
 
   // 4. 跨站 WS 门禁：带外部 Origin 的升级必须被拒绝（不带 Origin 的 CLI 连接已在
@@ -165,6 +185,7 @@ try {
     ...(!fontOk ? ['CSP 缺 gstatic.loli.net'] : []),
     ...(!nosniff ? ['缺 nosniff'] : []),
     ...(joined.roomCode !== room ? ['WebSocket join 失败'] : []),
+    ...(!pongOk ? ['心跳 pong 未收到（DO autoResponse 失效）'] : []),
     ...(gate !== 403 ? [`跨站 WS 未被拦截（得到 ${gate}，期望 403）`] : []),
   ];
 

@@ -20,6 +20,13 @@ const SET_PASSWORD_REJECTIONS = new Set([
   'PASSWORD_REQUIRED'
 ]);
 
+// 信令心跳：服务端 room.ts 已配 setWebSocketAutoResponse('ping'→'pong')，但客户端
+// 此前从不下发 ping。移动端标签被系统冻结数分钟后底层 TCP 被静默杀死，而
+// ws.readyState 仍是 OPEN、onclose 不触发、UI 显示"已连接"——服务端把 file-request
+// 转发进这条死管道，接收方永远收不到且无法自愈。心跳负责探测并重建这种半死连接。
+const WS_PING_INTERVAL_MS = 20000;  // 每 20s 主动 ping 一次
+const WS_PONG_TIMEOUT_MS = 10000;   // 发出 ping 后 10s 内没收到 pong 判定连接已死
+
 class CloudDrop {
   constructor() {
     this.peerId = null;
@@ -82,6 +89,10 @@ class CloudDrop {
     this.reconnectAttempts = 0;
     this.reconnectTimer = null;
     this.reconnectPending = false;
+
+    // 信令心跳：定时发 'ping'，服务端自动回 'pong'；超时未回判定半死连接并重建
+    this.wsPingTimer = null;
+    this.wsPongTimer = null;
 
     // 房间内设置密码（防抢注的创建流程）
     this._setPasswordPending = false;
@@ -889,6 +900,53 @@ class CloudDrop {
   }
 
   /**
+   * 信令心跳：服务端 room.ts 配了 setWebSocketAutoResponse('ping'→'pong')。
+   * 定时发文本帧 'ping'；若 WS_PONG_TIMEOUT_MS 内没等到 'pong'，判定连接已半死
+   * （移动端冻结/中间层静默掐链时 readyState 仍为 OPEN、onclose 不来），
+   * 主动断开并走标准重连 —— 否则服务端会把 file-request 等信令转发进死管道，
+   * 接收方永远收不到文件提示。
+   */
+  startHeartbeat() {
+    this.stopHeartbeat();
+    this.wsPingTimer = setInterval(() => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      try {
+        this.ws.send('ping');
+      } catch (e) {
+        this.handleDeadConnection();
+        return;
+      }
+      if (this.wsPongTimer) clearTimeout(this.wsPongTimer);
+      this.wsPongTimer = setTimeout(() => this.handleDeadConnection(), WS_PONG_TIMEOUT_MS);
+    }, WS_PING_INTERVAL_MS);
+  }
+
+  stopHeartbeat() {
+    if (this.wsPingTimer) { clearInterval(this.wsPingTimer); this.wsPingTimer = null; }
+    if (this.wsPongTimer) { clearTimeout(this.wsPongTimer); this.wsPongTimer = null; }
+  }
+
+  /**
+   * 心跳超时判定连接已死：摘除旧连接回调（防迟到的 close 触发重复重连）、
+   * 强制断开，然后走标准重连路径。
+   */
+  handleDeadConnection() {
+    debugLog('[App] 信令心跳超时，判定连接半死，主动重建');
+    this.stopHeartbeat();
+    const old = this.ws;
+    if (old) {
+      old.onopen = null;
+      old.onmessage = null;
+      old.onerror = null;
+      old.onclose = null;
+      try { old.close(4003, 'heartbeat timeout'); } catch (e) { /* ignore */ }
+    }
+    this.ws = null;
+    ui.updateConnectionStatus('disconnected');
+    this.scheduleReconnect();
+  }
+
+  /**
    * 指数退避重连：3s 起步、30s 封顶、随机抖动；页面隐藏时暂停，
    * 恢复可见后立即重连（handleVisibilityChange）
    */
@@ -916,6 +974,17 @@ class CloudDrop {
    * 页面恢复可见：若有挂起的重连，立即执行
    */
   handleVisibilityChange() {
+    // 页面恢复可见：移动端后台冻结可能已静默掐断底层连接（readyState 仍为 OPEN），
+    // 立即发一次 ping 探活，不类等 20s 的下一个心跳周期
+    if (!document.hidden && this.ws && this.ws.readyState === WebSocket.OPEN && this.peerId) {
+      try {
+        this.ws.send('ping');
+        if (this.wsPongTimer) clearTimeout(this.wsPongTimer);
+        this.wsPongTimer = setTimeout(() => this.handleDeadConnection(), WS_PONG_TIMEOUT_MS);
+      } catch (e) {
+        this.handleDeadConnection();
+      }
+    }
     if (document.hidden || !this.reconnectPending) return;
     this.reconnectPending = false;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -950,6 +1019,8 @@ class CloudDrop {
         this.reconnectTimer = null;
       }
 
+      // 心跳在收到 joined 后启动（服务端 autoResponse 于 join 时配置，认证期无 pong 应答）
+
       // Clear existing peers on reconnect to avoid duplicates
       this.peers.clear();
       ui.clearPeersGrid(document.getElementById('peersGrid'));
@@ -980,6 +1051,12 @@ class CloudDrop {
     };
 
     this.ws.onmessage = async (e) => {
+      // 心跳 pong：纯文本帧，必须在 JSON.parse 前拦截（服务端 autoResponse 回的就是 'pong'）
+      if (e.data === 'pong') {
+        if (this.wsPongTimer) { clearTimeout(this.wsPongTimer); this.wsPongTimer = null; }
+        return;
+      }
+
       const message = JSON.parse(e.data);
 
       // Handle server error frames
@@ -1048,6 +1125,8 @@ class CloudDrop {
     };
 
     this.ws.onclose = (event) => {
+      this.stopHeartbeat();
+
       // Clear any pending secure-join timeout
       if (this._secureJoinTimeout) {
         clearTimeout(this._secureJoinTimeout);
@@ -1337,6 +1416,9 @@ class CloudDrop {
         break;
       case 'joined':
         this.peerId = msg.peerId;
+        // joined 后才发 ping：服务端 autoResponse（ping→pong）在 handleJoin 中配置，
+        // 认证/等待期发 ping 不会得到应答
+        this.startHeartbeat();
         // Joined successfully - cancel any secure-join timeout
         if (this._secureJoinTimeout) {
           clearTimeout(this._secureJoinTimeout);
