@@ -134,7 +134,12 @@ export class I18n {
 
     // Return key if no translation found
     if (translation === undefined) {
-      console.warn(`[i18n] Missing translation for key: ${key}`);
+      // 语言包尚未加载时不报警：模块构造期（如 app.js 构造函数里调
+      // ui.generateDisplayName()）调 t() 必然取不到值，此时刷警告只会淹掉
+      // 真正的缺键。等 init() 载入语言包后警告恢复有效。
+      if (this.translations[this.locale] || this.translations[this.fallbackLocale]) {
+        console.warn(`[i18n] Missing translation for key: ${key}`);
+      }
       return key;
     }
 
