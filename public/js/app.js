@@ -291,11 +291,13 @@ class CloudDrop {
 
     let setPasswordTimer = null;
     try {
-      // Generate password hash for server
-      const passwordHash = await cryptoManager.hashPasswordForServer(password, roomCode);
-
+      // 两条互不依赖的 100k PBKDF2（服务端 verifier / 房间加密密钥）并行跑：
+      // WebCrypto 在后台线程执行，串行 ~500ms 的进房壁钟时间压到 ~250ms。
       // 本地先就绪密码状态（若房间已有密码，服务端会发 challenge 走 auth 流程）
-      await cryptoManager.setRoomPassword(password, roomCode);
+      const [passwordHash] = await Promise.all([
+        cryptoManager.hashPasswordForServer(password, roomCode),
+        cryptoManager.setRoomPassword(password, roomCode),
+      ]);
       this.roomPassword = password;
       this.roomPasswordHash = passwordHash;
       this.isSecureRoom = true;
@@ -397,11 +399,12 @@ class CloudDrop {
     const normalizedRoomCode = roomCode.toUpperCase();
 
     try {
-      // Generate password hash (using normalized room code)
-      const passwordHash = await cryptoManager.hashPasswordForServer(password, normalizedRoomCode);
-
-      // Set room password for client-side encryption
-      await cryptoManager.setRoomPassword(password, normalizedRoomCode);
+      // verifier 与房间密钥两次 100k PBKDF2 并行（见 createSecureRoom 同款说明），
+      // 用 normalizedRoomCode，与服务端派生保持一致
+      const [passwordHash] = await Promise.all([
+        cryptoManager.hashPasswordForServer(password, normalizedRoomCode),
+        cryptoManager.setRoomPassword(password, normalizedRoomCode),
+      ]);
 
       // Store password info
       this.roomPassword = password;
