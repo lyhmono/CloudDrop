@@ -138,6 +138,7 @@
     "safetyCodeUnavailable": "Peer key not ready yet, try again later",
     "keyChanged": "Device key changed",
     "keyChangedTitle": "This device's public key does not match the trusted record. It may have been reinstalled or replaced - please re-verify",
+    "identityVerifyFailed": "Identity verification failed; device was not added to the trusted list",
     "keyChangedToast": "{{name}}'s key changed. Previous trust revoked, please re-verify"
   },
   "fileRequest": {

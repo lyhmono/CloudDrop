@@ -1101,7 +1101,10 @@ export class WebRTCManager {
     if (!this.pendingCandidates.has(peerId)) {
       this.pendingCandidates.set(peerId, []);
     }
-    this.pendingCandidates.get(peerId).push(candidate);
+    const pending = this.pendingCandidates.get(peerId);
+    // 上限：remoteDescription 未就绪时，异常候选洪灌不能无限累积
+    if (pending.length >= 256) pending.shift();
+    pending.push(candidate);
   }
 
   // Send file - automatically uses best available method
@@ -1798,6 +1801,9 @@ export class WebRTCManager {
    */
   _matchAuthorizedMeta(authorized, msg) {
     const { size, totalChunks } = msg;
+    if (typeof msg.fileId !== 'string' || !msg.fileId) return false;
+    if (typeof msg.name !== 'string') return false;
+    if (msg.mimeType !== undefined && typeof msg.mimeType !== 'string') return false;
     if (!Number.isInteger(size) || size < 0 || size > MAX_FILE_SIZE) return false;
     if (!Number.isInteger(totalChunks) || totalChunks < 0) return false;
     if (totalChunks > Math.ceil(MAX_FILE_SIZE / CHUNK_SIZE) + 1) return false;
@@ -2086,12 +2092,23 @@ export class WebRTCManager {
             console.error('[WebRTC] Failed to decrypt text message:', e);
             content = i18n.t('chat.undecryptable');
           }
+        } else {
+          // P2P 文本协议已强制 E2EE：未加密 text 帧不投递原文，
+          // 防对端用明文伪装成已加密消息（协议降级防护）
+          console.warn('[WebRTC] 拒收未加密的 P2P 文本帧');
+          return;
         }
         if (this.onTextReceived) this.onTextReceived(peerId, content);
       }
     } else {
       const transfer = this.incomingTransfers.get(peerId);
       if (transfer) {
+        // 与 relay 路径同语义的上限防线：超出授权计数/字节数的分块一律丢弃，
+        // 防恶意 peer 在授权 file-start 后无界推送分块（撑爆磁盘配额/内存）
+        if (transfer.chunkCount >= transfer.totalChunks || transfer.received >= transfer.size) {
+          debugLog('[WebRTC] P2P 分块超出授权计数，已丢弃');
+          return;
+        }
         // AAD 绑定（P2P 有序到达，接收序号与发送序号一致）
         const aad = `${transfer.fileId}:${transfer.chunkCount}:${transfer.totalChunks}`;
         let decrypted;
@@ -2318,6 +2335,10 @@ export class WebRTCManager {
           console.error('[WebRTC] Failed to decrypt relay text message:', e);
           content = i18n.t('chat.undecryptableRelay');
         }
+      } else {
+        // 中继文本同样强制 E2EE：未加密帧不投递原文
+        console.warn('[WebRTC] 拒收未加密的 relay 文本帧');
+        return;
       }
       if (this.onTextReceived) this.onTextReceived(peerId, content);
     }

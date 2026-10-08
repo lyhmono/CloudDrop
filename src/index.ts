@@ -24,8 +24,10 @@ let cachedIceServers: { iceServers: unknown[]; expiresAt: number } | null = null
 interface RateWindow { count: number; resetAt: number }
 const iceServersRequestLimits = new Map<string, RateWindow>();
 const checkPasswordRequestLimits = new Map<string, RateWindow>();
+const wsHandshakeLimits = new Map<string, RateWindow>();
 const ICE_SERVERS_MAX_PER_IP = 10;         // 10 requests
 const CHECK_PASSWORD_MAX_PER_IP = 30;      // 30 requests
+const WS_HANDSHAKE_MAX_PER_IP = 60;        // WS 握手 60 次/分钟/IP（容忍 CGNAT 共享出口，仍能拦洪水建连）
 const RATE_WINDOW_MS = 60 * 1000;          // per minute, per IP
 
 function isIpRateLimited(store: Map<string, RateWindow>, ip: string, maxPerIp: number): boolean {
@@ -98,6 +100,14 @@ export default {
       if (!isTrustedOrigin(request)) {
         return new Response('Forbidden: cross-origin WebSocket', {
           status: 403,
+          headers: { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' },
+        });
+      }
+      // WS 握手频控：防匿名高频建连（每房间一个 DO 冷启动 + 连接成本）
+      const wsIp = request.headers.get('CF-Connecting-IP') || 'unknown';
+      if (isIpRateLimited(wsHandshakeLimits, wsIp, WS_HANDSHAKE_MAX_PER_IP)) {
+        return new Response('Too many requests', {
+          status: 429,
           headers: { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' },
         });
       }
@@ -208,10 +218,10 @@ async function handleIceServers(request: Request, env: Env): Promise<Response> {
     }
 
     try {
-      // Serve from cache while at least 1h of TTL remains (TTL is 24h)
-      if (cachedIceServers && cachedIceServers.expiresAt - Date.now() > 60 * 60 * 1000) {
+      // Serve from cache while at least 10min of TTL remains (credential TTL is 1h)
+      if (cachedIceServers && cachedIceServers.expiresAt - Date.now() > 10 * 60 * 1000) {
         return new Response(JSON.stringify({ iceServers: cachedIceServers.iceServers }), {
-          headers: { ...jsonHeaders, 'Cache-Control': 'public, max-age=300' },
+          headers: { ...jsonHeaders, 'Cache-Control': 'private, max-age=60' },
         });
       }
 
@@ -223,7 +233,7 @@ async function handleIceServers(request: Request, env: Env): Promise<Response> {
             'Authorization': `Bearer ${env.TURN_KEY_API_TOKEN}`,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ ttl: 86400 }), // 24 hours
+          body: JSON.stringify({ ttl: 3600 }), // 1h：凭据一旦外泄，可滥用窗口从 24h 压到 1h
         }
       );
 
@@ -238,11 +248,11 @@ async function handleIceServers(request: Request, env: Env): Promise<Response> {
           return s;
         });
 
-        // TTL 24h：缓存 23h，留 1h 余量；服务函数按"剩余 ≥1h"判有效
-        cachedIceServers = { iceServers: filteredServers, expiresAt: Date.now() + 23 * 60 * 60 * 1000 };
+        // 凭据 TTL 1h：缓存 50min 留 10min 余量；服务函数按"剩余 >10min"判有效
+        cachedIceServers = { iceServers: filteredServers, expiresAt: Date.now() + 50 * 60 * 1000 };
 
         return new Response(JSON.stringify({ iceServers: filteredServers }), {
-          headers: { ...jsonHeaders, 'Cache-Control': 'public, max-age=300' },
+          headers: { ...jsonHeaders, 'Cache-Control': 'private, max-age=60' },
         });
       }
     } catch (error) {

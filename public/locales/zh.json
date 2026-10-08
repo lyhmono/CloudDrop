@@ -136,6 +136,7 @@
     "safetyCodeUnavailable": "对方密钥尚未就绪，稍后再试",
     "keyChanged": "设备密钥已变化",
     "keyChangedTitle": "此设备的公钥与已信任记录不一致，可能是重装或设备被替换，请重新验证",
+    "identityVerifyFailed": "身份验证失败，未能加入信任列表",
     "keyChangedToast": "检测到 {{name}} 的密钥已变化，原信任已取消，请重新验证"
   },
   "fileRequest": {

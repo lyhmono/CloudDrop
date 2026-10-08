@@ -674,7 +674,10 @@ export class Room {
    */
   private sanitizeString(str: string, maxLength: number): string {
     if (!str) return '';
-    return str.substring(0, maxLength);
+    // 剥离控制字符与 Bidi 覆盖符（设备名/浏览器信息会被展示，防 UI 与终端欺骗）
+    return str
+      .replace(/[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '')
+      .substring(0, maxLength);
   }
 
   /**
@@ -700,7 +703,7 @@ export class Room {
     const attachment: PeerAttachment = {
       id: peerId,
       name: sanitizedName,
-      deviceType: joinData.deviceType || 'desktop',
+      deviceType: ['mobile', 'tablet'].includes(joinData.deviceType) ? joinData.deviceType : 'desktop',
       browserInfo: this.sanitizeString(joinData.browserInfo || '', 100), // Limit browser info length
       deviceKey: this.sanitizeString(joinData.deviceKey || '', 500), // 设备身份公钥（SPKI base64）
       isAuthenticated: true, // If they reached here, they are authenticated (or no password required)

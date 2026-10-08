@@ -110,13 +110,23 @@ export class CryptoManager {
       []
     );
 
-    // Derive shared secret using ECDH
+    // Derive shared secret using ECDH then stretch with HKDF
+    // （RFC 7748：裸 X 坐标不直接当 AES-GCM 密钥；info 绑定协议版本，
+    // 同一 ECDH 输出不会在不同上下文复用）
+    const ecdhBits = await crypto.subtle.deriveBits(
+      { name: 'ECDH', public: peerPublicKey },
+      this.keyPair.privateKey,
+      256
+    );
+    const hkdfBase = await crypto.subtle.importKey('raw', ecdhBits, 'HKDF', false, ['deriveKey']);
     const sharedSecret = await crypto.subtle.deriveKey(
       {
-        name: 'ECDH',
-        public: peerPublicKey
+        name: 'HKDF',
+        hash: 'SHA-256',
+        salt: new Uint8Array(32),
+        info: new TextEncoder().encode('clouddrop-e2ee-v2')
       },
-      this.keyPair.privateKey,
+      hkdfBase,
       {
         name: 'AES-GCM',
         length: 256
@@ -628,17 +638,30 @@ export class CryptoManager {
   }
 
   /**
-   * Generate password hash for server verification (SHA-256)
+   * Generate password verifier for server (PBKDF2-SHA256, 100k iters)
    * @param {string} password - Room password
    * @param {string} roomCode - Room code (used as salt)
    * @returns {Promise<string>} Hex-encoded hash
    */
   async hashPasswordForServer(password, roomCode) {
+    // 校验值与房间加密密钥同强度派生（PBKDF2 100k，独立盐串 info）：
+    // 单轮 SHA-256 可被 GPU 每秒亿级爆破，服务器存储泄漏即等于密码泄露。
+    // 盐用 clouddrop-verifier- 前缀，与 clouddrop-room- 的加密密钥派生互相独立。
     const encoder = new TextEncoder();
-    const data = encoder.encode(`${password}:${roomCode}:clouddrop`);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']
+    );
+    const bits = await crypto.subtle.deriveBits(
+      {
+        name: 'PBKDF2',
+        salt: encoder.encode('clouddrop-verifier-' + roomCode),
+        iterations: 100000,
+        hash: 'SHA-256'
+      },
+      keyMaterial,
+      256
+    );
+    return Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, '0')).join('');
   }
 
   // ============================================

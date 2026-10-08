@@ -69,6 +69,18 @@ export function escapeHtml(str) {
   return div.innerHTML;
 }
 
+/** 文件名清洗：剥路径与控制字符（peer 可控展示/下载名，防钓鱼与换行注入） */
+export function basename(name) {
+  if (typeof name !== 'string') return 'file'; // 非字符串/缺失：给安全的占位名，避免下载属性为空
+  let n = name.split('/').pop().split(String.fromCharCode(92)).pop() || '';
+  // 保留可见字符；剥离控制字符与 Bidi 覆盖符（防 U+202E 文件名换序钓鱼）
+  n = Array.from(n).filter((ch) => {
+    const c = ch.codePointAt(0);
+    return c >= 0x20 && c !== 0x7f && !(c >= 0x200E && c <= 0x200F) && !(c >= 0x202A && c <= 0x202E) && !(c >= 0x2066 && c <= 0x2069);
+  }).join('').slice(0, 200);
+  return n || 'file';
+}
+
 // Format file size
 export function formatFileSize(bytes) {
   if (bytes === 0) return '0 B';

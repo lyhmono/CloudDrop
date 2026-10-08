@@ -138,6 +138,7 @@
     "safetyCodeUnavailable": "Clé du pair pas encore prête",
     "keyChanged": "Clé de l'appareil modifiée",
     "keyChangedTitle": "La clé publique ne correspond pas à l'enregistrement de confiance. Vérifiez à nouveau",
+    "identityVerifyFailed": "Échec de la vérification d'identité : l'appareil n'a pas été ajouté aux appareils de confiance",
     "keyChangedToast": "La clé de {{name}} a changé. Confiance précédente révoquée"
   },
   "fileRequest": {

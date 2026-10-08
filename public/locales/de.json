@@ -138,6 +138,7 @@
     "safetyCodeUnavailable": "Schlüssel des Peers noch nicht bereit",
     "keyChanged": "Geräteschlüssel geändert",
     "keyChangedTitle": "Der öffentliche Schlüssel stimmt nicht mit dem Vertrauensdatensatz überein. Bitte erneut prüfen",
+    "identityVerifyFailed": "Identitätsprüfung fehlgeschlagen; Gerät wurde nicht zur Vertrauensliste hinzugefügt",
     "keyChangedToast": "Der Schlüssel von {{name}} hat sich geändert. Früheres Vertrauen widerrufen"
   },
   "fileRequest": {

@@ -11,7 +11,12 @@ export const ChatMixin = {
     if (!this.messageHistory.has(peerId)) {
       this.messageHistory.set(peerId, []);
     }
-    this.messageHistory.get(peerId).push(message);
+    const history = this.messageHistory.get(peerId);
+    history.push(message);
+    if (history.length > 500) {
+      history.splice(0, history.length - 500); // 环形上限，防长跑会话内存无界膨胀
+      this.renderedChatCounts.delete(peerId); // 掐头后增量计数失真，强制下次全量重建
+    }
   },
 
   getMessageHistory(peerId) {

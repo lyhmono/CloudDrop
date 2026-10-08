@@ -136,6 +136,7 @@
     "safetyCodeUnavailable": "相手の鍵がまだ準備できていません",
     "keyChanged": "端末の鍵が変更されました",
     "keyChangedTitle": "端末の公開鍵が信頼済み記録と一致しません。再検証してください",
+    "identityVerifyFailed": "ID 認証に失敗したため、信頼リストに追加できません",
     "keyChangedToast": "{{name}} の鍵が変更されました。以前の信頼は取り消されました"
   },
   "fileRequest": {

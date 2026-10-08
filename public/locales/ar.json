@@ -142,6 +142,7 @@
     "safetyCodeUnavailable": "مفتاح النظير غير جاهز بعد",
     "keyChanged": "تم تغيير مفتاح الجهاز",
     "keyChangedTitle": "المفتاح العام لا يطابق سجل الثقة. يرجى إعادة التحقق",
+    "identityVerifyFailed": "فشل التحقق من الهوية؛ لم تتم إضافة الجهاز إلى قائمة الثقة",
     "keyChangedToast": "تغير مفتاح {{name}}. تم إلغاء الثقة السابقة"
   },
   "fileRequest": {

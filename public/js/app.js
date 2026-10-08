@@ -852,7 +852,10 @@ class CloudDrop {
   generateRoomCode() {
     const chars = ROOM.CODE_CHARS;
     let code = '';
-    for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    // 安全随机：房间号即访问凭证，必须用 CSPRNG（Math.random 可预测）
+    const rnd = new Uint8Array(6);
+    crypto.getRandomValues(rnd);
+    for (let i = 0; i < 6; i++) code += chars[rnd[i] % chars.length];
     return code;
   }
 
@@ -1075,6 +1078,8 @@ class CloudDrop {
           case 'PASSWORD_INCORRECT':
             ui.showToast(i18n.t('room.passwordError'), 'error');
             this.clearRoomPassword();
+            this.pendingFileRequest = null;
+            this.cleanupDownloadModal();
             // 认证失败的连接服务端不回 close 握手，close(4002) 只能把它推到
             // CLOSING，onclose 要等到挑战超时（8s）才被兜底触发。所以这里
             // 自己收口，别把「弹密码框」压在一个可能不来的事件上
@@ -1242,11 +1247,11 @@ class CloudDrop {
         this.saveMessage(peerId, {
           type: 'received',
           messageType: 'image',
-          imageData: messageData.data,
+          imageData: typeof messageData.data === 'string' ? messageData.data : '',
           timestamp: Date.now()
         });
       } else {
-        const textContent = messageData.content || text;
+        const textContent = typeof messageData.content === 'string' ? messageData.content : text;
         this.saveMessage(peerId, { type: 'received', text: textContent, timestamp: Date.now() });
       }
 
@@ -1270,7 +1275,7 @@ class CloudDrop {
       if (messageData.type === 'image') {
         ui.showToast(i18n.t('chat.receivedImage', { name: peerName }), 'info');
       } else {
-        const displayText = messageData.content || text;
+        const displayText = typeof messageData.content === 'string' ? messageData.content : text;
         ui.showToast(`${peerName}: ${displayText.substring(0, 30)}${displayText.length > 30 ? '...' : ''}`, 'info');
       }
 
@@ -1445,7 +1450,7 @@ class CloudDrop {
           this.updateRoomDisplay();
           debugLog('[Signaling] Room code:', this.roomCode);
         }
-        msg.peers?.forEach(p => this.addPeer(p));
+        if (Array.isArray(msg.peers)) msg.peers.forEach(p => { if (p && typeof p === 'object' && typeof p.id === 'string') this.addPeer(p); });
 
         // Show room info hint if no peers (help users understand they need to share room code)
         if (!msg.peers || msg.peers.length === 0) {
@@ -1497,6 +1502,9 @@ class CloudDrop {
         // 房间里其他人设置了密码：清理本地状态，作废旧 P2P 链路，
         // 提示重新输入密码加入
         this.clearRoomPassword();
+        // 撤权即释放排队下载与待确认请求（防 objectURL 泄漏/弹窗悬挂）
+        this.pendingFileRequest = null;
+        this.cleanupDownloadModal();
         this.webrtc?.closeAll();
         this.peers.clear();
         ui.clearPeersGrid(document.getElementById('peersGrid'));
@@ -1530,21 +1538,27 @@ class CloudDrop {
     const peer = this.peers.get(peerId);
     const isRelayMode = data.transferMode === 'relay';
     const isBatch = Array.isArray(data.files) && data.files.length >= 1;
+    // 批量上限：拒绝伪造/异常元数据（防 100k 条目打爆 UI 与内存聚合）
+    if (isBatch && data.files.length > 1000) {
+      console.warn('[App] 批量文件请求条目过多，已拒绝:', data.files.length);
+      this.webrtc.respondToFileRequest(peerId, data.batchId, false); // 明确回执拒绝，发送方不悬挂
+      return;
+    }
 
     // 展示信息（批量：文件数+总大小）
     const displayName = isBatch
       ? i18n.t('transfer.fileCount', { count: data.files.length })
-      : data.name;
+      : (typeof data.name === 'string' ? ui.basename(data.name) : i18n.t('fileTypes.file'));
     const displaySize = isBatch
-      ? data.files.reduce((sum, f) => sum + (f.size || 0), 0)
-      : data.size;
+      ? data.files.reduce((sum, f) => sum + (Number.isInteger(f.size) && f.size > 0 ? f.size : 0), 0)
+      : (Number.isInteger(data.size) && data.size >= 0 ? data.size : 0);
 
     // Store pending request info（并发请求时用局部引用避免串号）
     const request = { peerId, fileId: isBatch ? data.batchId : data.fileId, data, isBatch };
     this.pendingFileRequest = request;
 
     // Check if this device is trusted - auto-accept if so
-    if (peer && await this.isDeviceTrusted(peer)) {
+    if (peer && !this.webrtc.incomingTransfers.has(peerId) && await this.isDeviceTrusted(peer)) {
       // 密钥指纹信任：先验证对方确实持有设备私钥，防公钥抄袭伪造
       const verified = await this.verifyPeerIdentity(peer);
       if (verified) {
@@ -1623,7 +1637,7 @@ class CloudDrop {
 
     if (isBatch) {
       // 批量：后续每个文件的 file-start 会自行建立传输状态（confirmed 直接开始）
-      const totalSize = data.files.reduce((sum, f) => sum + (f.size || 0), 0);
+      const totalSize = data.files.reduce((sum, f) => sum + (Number.isInteger(f.size) && f.size > 0 ? f.size : 0), 0);
       ui.showReceivingModal(
         i18n.t('transfer.fileCount', { count: data.files.length }),
         totalSize,
@@ -1679,6 +1693,12 @@ class CloudDrop {
 
     // Trust the device first
     if (peer) {
+      // 必须先通过设备私钥挑战：防"总是接受"把 peer 自报公钥直接 pin 成永久信任
+      const verified = await this.verifyPeerIdentity(peer);
+      if (!verified) {
+        ui.showToast(i18n.t('settings.identityVerifyFailed'), 'error');
+        return;
+      }
       await this.trustDevice(peer);
     }
 
@@ -1720,6 +1740,8 @@ class CloudDrop {
   }
 
   addPeer(peer) {
+    // 纵深防御：deviceType 白名单（服务端已收敛，此处防旧版服务器）
+    if (!['desktop', 'mobile', 'tablet'].includes(peer.deviceType)) peer.deviceType = 'desktop';
     this.peers.set(peer.id, peer);
     ui.addPeerToGrid(peer, document.getElementById('peersGrid'), (p, e) => this.onPeerClick(p, e));
 
@@ -1777,6 +1799,8 @@ class CloudDrop {
       const peer = this.peers.get(peerId);
       const code = await cryptoManager.computeSafetyCode(peerId, peer?.deviceKey || null);
       if (code) ui.updatePeerSafetyCode(peerId, code);
+      // 无 deviceKey：对端缺持久身份，信令侧 MITM 可换公钥令两侧一致——红字警示
+      if (peer && !peer.deviceKey) ui.updatePeerKeyWarning(peerId, true);
     } catch (e) {
       console.warn('[App] 安全码计算失败:', e);
     }
@@ -1952,10 +1976,16 @@ class CloudDrop {
    * 批量接收时若弹窗已打开，则排队展示，避免前一文件的下载 URL 被撤销覆盖
    */
   showFileDownloadModal(fileName, blob) {
+    // 对端可控文件名统一清洗后再展示与用于 download 属性
+    fileName = ui.basename(fileName);
     const modal = document.getElementById('fileDownloadModal');
     if (modal && modal.classList.contains('active')) {
       // 弹窗正在展示：入队，等待用户处理完当前文件
       this.downloadQueue.push({ fileName, blob });
+      if (this.downloadQueue.length > 20) {
+        const dropped = this.downloadQueue.shift();
+        console.warn('[App] 下载队列超限，丢弃最旧文件:', dropped.fileName);
+      }
       debugLog(`[App] 下载弹窗排队: ${fileName}（队列 ${this.downloadQueue.length}）`);
       return;
     }

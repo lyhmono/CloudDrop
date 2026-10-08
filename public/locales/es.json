@@ -138,6 +138,7 @@
     "safetyCodeUnavailable": "La clave del par aún no está lista",
     "keyChanged": "La clave del dispositivo cambió",
     "keyChangedTitle": "La clave pública no coincide con el registro de confianza. Verifica de nuevo",
+    "identityVerifyFailed": "Error de verificación de identidad; no se pudo aadir a la lista de confianza",
     "keyChangedToast": "La clave de {{name}} cambió. Confianza anterior revocada"
   },
   "fileRequest": {

@@ -136,6 +136,7 @@
     "safetyCodeUnavailable": "對方密鑰尚未就緒，稍後再試",
     "keyChanged": "裝置密鑰已變更",
     "keyChangedTitle": "此裝置的公鑰與已信任記錄不一致，請重新驗證",
+    "identityVerifyFailed": "身分驗證失敗，未能加入信任清單",
     "keyChangedToast": "偵測到 {{name}} 的密鑰已變更，原信任已取消"
   },
   "fileRequest": {
