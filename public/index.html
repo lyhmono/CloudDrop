@@ -15,7 +15,7 @@
   <meta property="og:url" content="https://clouddrop.app/">
   <meta property="og:title" content="CloudDrop - 安全 P2P 文件共享">
   <meta property="og:description" content="安全的点对点文件共享工具，无需安装，端到端加密，支持跨设备即时传输">
-  <meta property="og:image" content="/og-image.png">
+  <meta property="og:image" content="https://cs.nnaa.us.ci/pwa-icon-512.png">
   <meta property="og:locale" content="zh_CN">
   <meta property="og:site_name" content="CloudDrop">
 
@@ -23,7 +23,7 @@
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="CloudDrop - 安全 P2P 文件共享">
   <meta name="twitter:description" content="安全的点对点文件共享工具，无需安装，端到端加密，支持跨设备即时传输">
-  <meta name="twitter:image" content="/og-image.png">
+  <meta name="twitter:image" content="https://cs.nnaa.us.ci/pwa-icon-512.png">
 
   <!-- PWA & Mobile -->
   <meta name="theme-color" content="#0f0f23">
@@ -791,7 +791,7 @@
             placeholder="输入 6 位房间号" maxlength="6" pattern="[a-zA-Z0-9]*">
           <div class="password-section" id="joinRoomPasswordSection" style="display: none; margin-top: 12px;">
             <div class="password-input-wrapper">
-              <input type="password" class="room-input" id="joinRoomPassword"
+              <input type="password" class="room-input" id="joinRoomPassword" autocomplete="off"
                 data-i18n-placeholder="room.passwordPlaceholder" placeholder="房间密码（至少6位）" minlength="6">
               <button class="btn-icon password-toggle" id="joinPasswordToggle" type="button">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -850,7 +850,7 @@
           <div class="form-group">
             <label class="form-label" data-i18n="room.password">房间密码</label>
             <div class="password-input-wrapper">
-              <input type="password" class="room-input" id="secureRoomPassword"
+              <input type="password" class="room-input" id="secureRoomPassword" autocomplete="off"
                 data-i18n-placeholder="room.passwordMinLength" placeholder="至少6位字符" minlength="6">
               <button class="btn-icon password-toggle" id="createPasswordToggle" type="button">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
