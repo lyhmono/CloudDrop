@@ -351,6 +351,7 @@
   "verify": {
     "title": "Verificación completa",
     "hint": "Abre el panel de verificación en el otro dispositivo y confirma que la información coincide.",
+    "quickCode": "Código rápido (leerlo en voz alta)",
     "words": "Palabras de seguridad",
     "fingerprint": "Huella completa (escanear)",
     "warning": "Confirma que coinciden y fija la clave pública. Si cambia, se mostrará una advertencia roja y se revocará la confianza.",

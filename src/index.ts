@@ -174,6 +174,10 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
     const clientIP = request.headers.get('CF-Connecting-IP') ||
                      request.headers.get('X-Forwarded-For')?.split(',')[0] ||
                      'default';
+    if (!env.ROOM_SALT) {
+      // fail-open 警示：无盐房号可被离线穷举反推 /24（见 wrangler.toml 说明）
+      console.error('[Security] ROOM_SALT secret is not set - auto room codes are offline-reversible to client /24 subnets. Run: npx wrangler secret put ROOM_SALT');
+    }
     const ipHash = await generateRoomId(clientIP, env.ROOM_SALT || '');
     roomCode = ipHash.substring(0, 6).toUpperCase();
   }

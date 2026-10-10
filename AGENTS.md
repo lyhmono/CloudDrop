@@ -47,8 +47,8 @@ This guide summarizes the project, commands, coding standards, and architectural
     ```bash
     npm test
     ```
-    *Current Status: No test suite is configured ("echo 'No tests yet'").*
-    *Recommended: When adding tests, use `vitest` with `@cloudflare/vitest-pool-workers`.*
+    *Requires Node >= 22.18 (`package.json engines`): `tests/room-auth.test.mjs` and `tests/room-id.test.mjs` import `src/*.ts` directly via native type-stripping, and mock the Durable Object surface instead of a workers runtime.*
+    *Coverage: Room DO auth/set-password regression, room-id salting, frontend helpers (ui/crypto/webrtc), signaling smoke (`npm run smoke` boots wrangler dev locally).*
 
 *   **Type Check**
     ```bash

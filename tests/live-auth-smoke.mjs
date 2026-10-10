@@ -3,10 +3,16 @@
  * challenge/auth-success → 错口令拒绝 → 重复设密拒绝 → 未认证消息拒绝
  * node tests/live-auth-smoke.mjs [wss-base]
  */
-const BASE = process.argv[2] || 'wss://cs.nnaa.us.ci/ws';
-const ROOM = ('LA' + Math.floor(Math.random() * 10000).toString().padStart(4, '0')).toUpperCase();
+// base 必填：脚本会在房间内真实设密/发消息，不能默认指向生产环境
+// （本地示例）node tests/live-auth-smoke.mjs ws://localhost:8787/ws
+const BASE = process.argv[2];
+if (!BASE) { console.error('用法: node tests/live-auth-smoke.mjs <ws-base，如 ws://localhost:8787/ws>'); process.exit(1); }
+// 全随机房间号：避免固定前缀模式在共享环境被猜到残留锁房
+const ROOM = Array.from(crypto.getRandomValues(new Uint8Array(6)))
+  .map((b) => 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'[b % 62]).join('');
 const URL = `${BASE}?room=${ROOM}`;
-const HASH = 'ab'.repeat(32); // 64 hex，服务端格式校验用值（非真实口令）
+// 随机 64 hex 校验值格式占位（非真实口令），不用公开写死的常量
+const HASH = Array.from(crypto.getRandomValues(new Uint8Array(32))).map((b) => b.toString(16).padStart(2, '0')).join('');
 
 const sha256hex = async (s) => {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
@@ -71,8 +77,8 @@ const main = async () => {
   check('新连接先收到 challenge(nonce)', !!ch.data?.nonce);
   const good = await sha256hex(HASH + ch.data.nonce);
   B.send(JSON.stringify({ type: 'auth', data: { response: good } }));
-  await B._wait((m) => m?.type === 'auth-success');
-  check('正确 response 通过认证 (auth-success)', true);
+  const authMsg = await B._wait((m) => m?.type === 'auth-success');
+  check('正确 response 通过认证 (auth-success)', authMsg?.type === 'auth-success');
   B.send(JSON.stringify({ type: 'join', data: { name: 'PeerB', deviceType: 'tablet', deviceKey: 'KD-B' } }));
   const jb = await B._wait((m) => m?.type === 'joined');
   check('认证后 join 成功', !!jb.peerId);

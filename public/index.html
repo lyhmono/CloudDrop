@@ -492,6 +492,11 @@
           <p class="verify-hint" data-i18n="verify.hint">在另一台设备上打开同一设备的验证面板，核对以下信息完全一致。</p>
 
           <div class="verify-section">
+            <div class="verify-label" data-i18n="verify.quickCode">快速码（短句核对）</div>
+            <div class="verify-words" id="verifyQuickCode"></div>
+          </div>
+
+          <div class="verify-section">
             <div class="verify-label" data-i18n="verify.words">安全词（口头核对）</div>
             <div class="verify-words" id="verifyWords"></div>
           </div>
@@ -791,8 +796,8 @@
             placeholder="输入 6 位房间号" maxlength="6" pattern="[a-zA-Z0-9]*">
           <div class="password-section" id="joinRoomPasswordSection" style="display: none; margin-top: 12px;">
             <div class="password-input-wrapper">
-              <input type="password" class="room-input" id="joinRoomPassword" autocomplete="off"
-                data-i18n-placeholder="room.passwordPlaceholder" placeholder="房间密码（至少6位）" minlength="6">
+              <input type="password" class="room-input" id="joinRoomPassword" autocomplete="new-password"
+                data-i18n-placeholder="room.passwordPlaceholder" placeholder="房间密码（至少6位）" minlength="6" maxlength="128">
               <button class="btn-icon password-toggle" id="joinPasswordToggle" type="button">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
@@ -850,8 +855,8 @@
           <div class="form-group">
             <label class="form-label" data-i18n="room.password">房间密码</label>
             <div class="password-input-wrapper">
-              <input type="password" class="room-input" id="secureRoomPassword" autocomplete="off"
-                data-i18n-placeholder="room.passwordMinLength" placeholder="至少6位字符" minlength="6">
+              <input type="password" class="room-input" id="secureRoomPassword" autocomplete="new-password"
+                data-i18n-placeholder="room.passwordMinLength" placeholder="至少6位字符" minlength="6" maxlength="128">
               <button class="btn-icon password-toggle" id="createPasswordToggle" type="button">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />

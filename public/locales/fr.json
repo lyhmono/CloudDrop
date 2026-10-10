@@ -351,6 +351,7 @@
   "verify": {
     "title": "Vérification complète",
     "hint": "Ouvrez le panneau de vérification sur l'autre appareil et confirmez la correspondance.",
+    "quickCode": "Code rapide (à lire à voix haute)",
     "words": "Mots de sécurité",
     "fingerprint": "Empreinte complète (scanner)",
     "warning": "Confirmez la correspondance puis épinglez la clé publique. En cas de changement, un avertissement rouge s'affichera.",

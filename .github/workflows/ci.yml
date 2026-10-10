@@ -7,16 +7,26 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+# 同一分支的并发运行互相覆盖部署结果——串行化，新提交胜出
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   typecheck:
     name: Type Check + JS Syntax
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # pinned to commit SHAs (supply-chain): bump deliberately, never silently
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          # >=22.18 required: unit tests import src/*.ts via native type-stripping
+          node-version: 24
           cache: npm
 
       - name: Install dependencies
@@ -27,7 +37,7 @@ jobs:
 
       - name: JS syntax check (frontend, ESM)
         run: |
-          for f in public/js/*.js; do node --input-type=module --check < "$f" || exit 1; done
+          for f in public/js/*.js public/sw.js; do node --input-type=module --check < "$f" || exit 1; done
 
       - name: Unit tests (node:test)
         run: npm test
@@ -41,18 +51,18 @@ jobs:
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
       - name: Install dependencies
         run: npm ci
 
       - name: Wrangler deploy
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

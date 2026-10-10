@@ -4,8 +4,10 @@
  * 验证：deviceType 服务端白名单 / name 控制字符剥离 / from 字段服务器覆写 /
  *      未 join 连接的消息被忽略 / 跨站 Origin 403（HTTP 层已在外部验证，此处跳过）
  */
-const BASE = process.argv[2] || 'wss://cs.nnaa.us.ci/ws';
-const ROOM = 'LT' + Math.floor(Math.random() * 100000).toString().padStart(4, '0').replace(/[OIL]/g, 'X').slice(0, 4);
+const BASE = process.argv[2];
+if (!BASE) { console.error('用法: node tests/live-smoke.mjs <ws-base，如 ws://localhost:8787/ws>（脚本会写入真实房间，勿默认指向生产）'); process.exit(1); }
+const ROOM = Array.from(crypto.getRandomValues(new Uint8Array(6)))
+  .map((b) => 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'[b % 62]).join('');
 const URL_ROOM = `${BASE}?room=${ROOM.toUpperCase()}`;
 
 const results = [];
