@@ -305,7 +305,6 @@ export class WebRTCManager {
 
     this.onFileReceived = null;
     this.onFileRequest = null; // Called when file request needs user confirmation
-    this.onFileRequestResponse = null; // Called when sender receives accept/decline
     this.onTransferStart = null; // Called when file transfer starts (with fileId)
     this.onProgress = null;
     this.onTextReceived = null;
@@ -1110,6 +1109,12 @@ export class WebRTCManager {
   // Send file - automatically uses best available method
   // Now with request/confirmation flow
   async sendFile(peerId, file) {
+    // 发送前预检：超过接收端硬上限的文件注定被拒，提前失败避免走完确认流程
+    // 后等 file-end-ack 超时报含糊的 TRANSFER_FAILED
+    if (!Number.isInteger(file.size) || file.size > MAX_FILE_SIZE) {
+      throw new Error(ERROR_CODES.FILE_TOO_LARGE);
+    }
+
     // Try to establish connection (may result in P2P or relay)
     await this.ensureConnection(peerId);
 
@@ -1153,6 +1158,13 @@ export class WebRTCManager {
    * @param {File[]} files - Files to send
    */
   async sendFiles(peerId, files) {
+    // 批量同样预检，任一超限即整批拒绝（与单文件语义一致）
+    for (const f of files) {
+      if (!Number.isInteger(f.size) || f.size > MAX_FILE_SIZE) {
+        throw new Error(ERROR_CODES.FILE_TOO_LARGE);
+      }
+    }
+
     // Try to establish connection (may result in P2P or relay)
     await this.ensureConnection(peerId);
 
@@ -1358,11 +1370,6 @@ export class WebRTCManager {
     if (pending) {
       pending.resolve(data.accepted);
     }
-
-    // Also notify via callback for UI updates
-    if (this.onFileRequestResponse) {
-      this.onFileRequestResponse(peerId, data.fileId, data.accepted);
-    }
   }
 
   /**
@@ -1518,7 +1525,7 @@ export class WebRTCManager {
             peerId, fileId, fileName: file.name, fileSize: file.size,
             sent: offset, total: file.size,
             percent: (offset / file.size) * 100,
-            speed: offset / elapsed
+            speed: elapsed > 0 ? offset / elapsed : 0
           });
         }
       }
@@ -1643,7 +1650,7 @@ export class WebRTCManager {
             peerId, fileId, fileName: file.name, fileSize: file.size,
             sent: Math.min(offset, file.size), total: file.size,
             percent: Math.min((offset / file.size) * 100, 100),
-            speed: offset / elapsed
+            speed: elapsed > 0 ? offset / elapsed : 0
           });
         }
 
@@ -3006,7 +3013,6 @@ export class WebRTCManager {
     // Detach callbacks so late async completions are ignored
     this.onFileReceived = null;
     this.onFileRequest = null;
-    this.onFileRequestResponse = null;
     this.onTransferStart = null;
     this.onProgress = null;
     this.onTextReceived = null;

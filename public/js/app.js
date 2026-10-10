@@ -17,7 +17,8 @@ const SET_PASSWORD_REJECTIONS = new Set([
   'FORBIDDEN',
   'PASSWORD_ALREADY_SET',
   'INVALID_PASSWORD_HASH',
-  'PASSWORD_REQUIRED'
+  'PASSWORD_REQUIRED',
+  'ROOM_OCCUPIED'
 ]);
 
 // 信令心跳：服务端 room.ts 已配 setWebSocketAutoResponse('ping'→'pong')，但客户端
@@ -363,6 +364,8 @@ class CloudDrop {
       case 'PASSWORD_ALREADY_SET':
       case 'PASSWORD_REQUIRED':
         return i18n.t('room.alreadyTakenByOther');
+      case 'ROOM_OCCUPIED':
+        return i18n.t('room.secureRoomOccupied');
       default:
         return i18n.t('room.createSecureFailed');
     }
@@ -551,9 +554,9 @@ class CloudDrop {
     const params = new URLSearchParams(location.search);
     const roomParam = params.get('room');
     if (roomParam && !ROOM.CODE_PATTERN.test(roomParam)) {
-      // 格式非法时不能静默换房：服务端 /ws 也用同一个正则校验，非法值会被它
-      // 回落到"按 IP 分配"的房间，用户会莫名进到另一个房间却毫无提示。
-      // 这里显式告知并按自动分配处理（房间号一律 6 位字母数字）。
+      // 格式非法时不能静默换房：服务端 /ws 用同一正则校验，非法值会直接回 400
+      // （连接失败）。这里先行拦截：显式告知用户、并按自动分配处理
+      // （房间号一律 6 位字母数字）。
       debugLog(`[App] 忽略非法房间号参数: ${roomParam}`);
       ui.showToast(i18n.t('room.invalidCode'), 'error');
       this.roomCode = null;
@@ -1056,7 +1059,7 @@ class CloudDrop {
       }
     };
 
-    this.ws.onmessage = async (e) => {
+    const handleWsFrame = async (e) => {
       // 心跳 pong：纯文本帧，必须在 JSON.parse 前拦截（服务端 autoResponse 回的就是 'pong'）
       if (e.data === 'pong') {
         if (this.wsPongTimer) { clearTimeout(this.wsPongTimer); this.wsPongTimer = null; }
@@ -1130,6 +1133,12 @@ class CloudDrop {
       }
 
       this.handleSignaling(message);
+    };
+
+    // 统一兜底：非法 JSON 帧或内部 await 抛错不再变成 unhandledrejection
+    // 并静默丢帧——至少留下日志，信令协议异常可被观测
+    this.ws.onmessage = (e) => {
+      handleWsFrame(e).catch((err) => console.error('[App] 信令帧处理失败:', err));
     };
 
     this.ws.onclose = (event) => {
@@ -1816,6 +1825,12 @@ class CloudDrop {
     ui.removePeerFromGrid(peerId, document.getElementById('peersGrid'));
     this.peerMsgQueues.delete(peerId);
     this.webrtc.closeConnection(peerId);
+    // 会话级残留一并清理：peerId 每次重连都会更换，旧条目不会再被读取；
+    // 不清则反复进出房间时 messageHistory 等无限增长
+    this.messageHistory.delete(peerId);
+    this.unreadMessages.delete(peerId);
+    this.renderedChatCounts.delete(peerId);
+    this.verifiedPeers.delete(peerId);
   }
 
   updateDeviceNameDisplay() {
@@ -1940,6 +1955,9 @@ class CloudDrop {
         break;
       case ERROR_CODES.FILE_CANCELLED:
         ui.showToast(i18n.t('transfer.transferCancelled'), 'info');
+        break;
+      case ERROR_CODES.FILE_TOO_LARGE:
+        ui.showToast(i18n.t('errors.fileTooBig'), 'error');
         break;
       case ERROR_CODES.MESSAGE_TOO_LARGE:
         ui.showToast(i18n.t('errors.messageTooLarge'), 'error');
@@ -3142,5 +3160,14 @@ Object.assign(CloudDrop.prototype, SettingsMixin);
 // Initialize app
 const app = new CloudDrop();
 app.init().catch(console.error);
+
+// PWA：注册 service worker（manifest 声明了 offline 能力，此前无 sw 兑现）。
+// 仅 https 或本地开发主机；注册失败不影响应用本身
+if ('serviceWorker' in navigator &&
+    (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch((e) => console.warn('[App] sw.js 注册失败:', e));
+  });
+}
 
 

@@ -71,7 +71,7 @@ export class CryptoManager {
         name: 'ECDH',
         namedCurve: 'P-256'
       },
-      true, // extractable
+      false, // private key never exportable; public key export works regardless
       ['deriveKey', 'deriveBits']
     );
     return this.keyPair;

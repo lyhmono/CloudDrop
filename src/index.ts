@@ -3,7 +3,7 @@
  * Routes requests to static assets or WebSocket signaling
  */
 
-import { Room } from './room';
+import { Room } from './room.ts';
 
 export { Room };
 
@@ -12,6 +12,11 @@ export interface Env {
   // Cloudflare TURN credentials (set in wrangler.toml or dashboard)
   TURN_KEY_ID?: string;
   TURN_KEY_API_TOKEN?: string;
+  // 自动房间码/网段桶哈希的服务端盐（建议 `wrangler secret put ROOM_SALT`）。
+  // 无盐时房号 = SHA-256(/24) 截取，全量 IPv4 /24 仅 ~1670 万个，可离线穷举
+  // 反推持有某房间码的用户网段；加盐后该反查需要服务端盐，不再可行。
+  // 未配置时回退旧行为（本地开发兼容），但生产部署应设置。
+  ROOM_SALT?: string;
 }
 
 // =============================================================================
@@ -70,6 +75,7 @@ function isTrustedOrigin(request: Request): boolean {
 
 const SECURITY_HEADERS: Record<string, string> = {
   'X-Content-Type-Options': 'nosniff',
+  'Strict-Transport-Security': 'max-age=15552000; includeSubDomains',
   'Referrer-Policy': 'strict-origin-when-cross-origin',
   'X-Frame-Options': 'DENY',
   'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), magnetometer=(), gyroscope=()',
@@ -151,15 +157,24 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   let roomId: string;
   let roomCode: string; // User-friendly room code to display
 
-  if (explicitRoom && /^[a-zA-Z0-9]{6}$/.test(explicitRoom)) {
-    // Explicit room code from URL parameter
+  // 显式给了 ?room= 但格式非法：必须报错而非静默回落到 IP 自动房——
+  // 否则手误/被截断的分享链接会把用户带进另一个陌生房间而毫无提示
+  if (explicitRoom && !/^[a-zA-Z0-9]{6}$/.test(explicitRoom)) {
+    return new Response(JSON.stringify({ success: false, error: 'Invalid room code format' }), {
+      status: 400,
+      headers: { ...SECURITY_HEADERS, 'Content-Type': 'application/json' },
+    });
+  }
+
+  if (explicitRoom) {
+    // 上方守卫已保证 6 位字母数字格式
     roomCode = explicitRoom.toUpperCase();
   } else {
     // Auto-assign room based on client IP
     const clientIP = request.headers.get('CF-Connecting-IP') ||
                      request.headers.get('X-Forwarded-For')?.split(',')[0] ||
                      'default';
-    const ipHash = await generateRoomId(clientIP);
+    const ipHash = await generateRoomId(clientIP, env.ROOM_SALT || '');
     roomCode = ipHash.substring(0, 6).toUpperCase();
   }
 
@@ -169,7 +184,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   // 客户端网段桶（IPv4 /24、IPv6 /64 哈希）：供房间内 per-IP 爆破计数。
   // CF-Connecting-IP 由 Cloudflare 边缘注入，客户端无法伪造（CF- 前缀头被剥离）
   const clientIP = request.headers.get('CF-Connecting-IP') || 'local-dev';
-  const ipBucket = await generateRoomId(clientIP);
+  const ipBucket = await generateRoomId(clientIP, env.ROOM_SALT || '');
 
   // Get or create the room Durable Object
   const roomObjectId = env.ROOM.idFromName(roomId);
@@ -273,8 +288,9 @@ async function handleIceServers(request: Request, env: Env): Promise<Response> {
  * IPv4: uses first 3 octets (/24 network)
  * IPv6: uses first 4 groups (/64 network prefix)
  * Local: uses 'localhost' as seed for consistent local room
+ * salt: 服务端盐，阻断「房号 → 反查网段」的离线穷举；空盐为旧行为
  */
-export async function generateRoomId(ip: string): Promise<string> {
+export async function generateRoomId(ip: string, salt = ''): Promise<string> {
   let networkPart: string;
 
   // For local development, use 'localhost' as seed
@@ -298,7 +314,7 @@ export async function generateRoomId(ip: string): Promise<string> {
 
   // Hash the network portion to generate room ID
   const encoder = new TextEncoder();
-  const data = encoder.encode(networkPart);
+  const data = encoder.encode(salt + networkPart);
   const hash = await crypto.subtle.digest('SHA-256', data);
   const hashArray = Array.from(new Uint8Array(hash));
   return hashArray.slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join('');

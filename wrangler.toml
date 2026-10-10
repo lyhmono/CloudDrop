@@ -14,3 +14,6 @@ class_name = "Room"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Room"]
+
+# 生产部署前必须设置（防止自动房间码被离线穷举反推用户 /24 网段）：
+#   npx wrangler secret put ROOM_SALT

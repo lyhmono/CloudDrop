@@ -16,8 +16,14 @@ export interface Env {
   ROOM: DurableObjectNamespace;
 }
 
+/** 入站消息类型（客户端 → Room，webSocketMessage 的 switch 处理集） */
+type IncomingMessageType = 'join' | 'offer' | 'answer' | 'ice-candidate' | 'name-changed' | 'relay-data' | 'key-exchange' | 'file-request' | 'file-response' | 'file-cancel' | 'identity-challenge' | 'identity-response' | 'set-password' | 'auth';
+
+/** 出站/广播消息类型（Room → 客户端；offer 等既入站也转发） */
+type OutgoingMessageType = 'joined' | 'peer-joined' | 'peer-left' | 'name-changed' | 'offer' | 'answer' | 'ice-candidate' | 'relay-data' | 'key-exchange' | 'file-request' | 'file-response' | 'file-cancel' | 'identity-challenge' | 'identity-response' | 'challenge' | 'auth-success' | 'room-locked' | 'set-password-result' | 'error';
+
 interface SignalingMessage {
-  type: 'join' | 'offer' | 'answer' | 'ice-candidate' | 'peer-joined' | 'peer-left' | 'relay-data' | 'name-changed' | 'key-exchange' | 'file-request' | 'file-response' | 'file-cancel' | 'identity-challenge' | 'identity-response' | 'set-password' | 'set-password-result' | 'room-locked' | 'auth' | 'auth-success' | 'challenge';
+  type: IncomingMessageType | OutgoingMessageType;
   from?: string;
   to?: string;
   data?: unknown;
@@ -38,6 +44,7 @@ interface PeerAttachment {
   authAttempts?: number; // Track failed attempts per connection
   clientBucket?: string; // 客户端网段桶（/24 或 /64 哈希），per-IP 爆破计数用
   joinedAt?: number; // 加入房间时间戳（设密在场要求）
+  connId?: string; // 连接级 ID：限流状态 Maps 的键（不得以 WebSocket 对象为键——强引用会阻断休眠）
 }
 
 /**
@@ -49,21 +56,25 @@ interface PeerAttachment {
 export class Room {
   private state: DurableObjectState;
   private passwordHash: string | null; // Password hash for secure rooms (null = no password)
-  private messageRateLimits: Map<WebSocket, { count: number; lastReset: number }> = new Map();
-  private relayByteBudget: Map<WebSocket, { tokens: number; lastRefill: number }> = new Map();
-  private relayDropWarn: Map<WebSocket, number> = new Map(); // ws -> last warning timestamp
-  // peerId -> WebSocket cache to avoid getWebSockets()+JSON deserialization per message.
-  // Lazily rebuilt (null on hibernation wake, stale entries pruned on close).
-  private peerWsCache: Map<string, WebSocket> | null = null;
-  private leaveNotified: WeakSet<WebSocket> = new WeakSet(); // peer-left 广播去重
+  // 限流状态全部以 connId 字符串为键：类属性持有 WebSocket 对象（作为值或
+  // Map 键）都是强引用，会阻断连接休眠/实例驱逐（AGENTS §3 Hibernation 约定）
+  private messageRateLimits: Map<string, { count: number; lastReset: number }> = new Map();
+  private relayByteBudget: Map<string, { tokens: number; lastRefill: number }> = new Map();
+  private iceByteBudget: Map<string, { tokens: number; lastRefill: number }> = new Map();
+  private relayDropWarn: Map<string, number> = new Map(); // connId -> last warning timestamp
+  private leaveNotified: WeakSet<WebSocket> = new WeakSet(); // peer-left 广播去重（弱引用，无害）
   // Removed global passwordAttempts to prevent DoS
 
   // Constants
   private static readonly MAX_NAME_LENGTH = 50;
   private static readonly RATE_LIMIT_WINDOW = 1000; // 1 second
   private static readonly MAX_MSGS_PER_WINDOW = 10; // 10 messages per second (control messages)
-  private static readonly RELAY_BYTES_PER_SEC = 2 * 1024 * 1024; // 2MB/s data budget for relay/ICE
+  private static readonly RELAY_BYTES_PER_SEC = 2 * 1024 * 1024; // 2MB/s data budget for relay
   private static readonly RELAY_BURST_BYTES = 4 * 1024 * 1024; // 4MB burst allowance
+  // ICE 候选独立小额预算：不随 2MB/s 的文件流量被挤占，保障 P2P 协商/恢复
+  private static readonly ICE_BYTES_PER_SEC = 64 * 1024;
+  private static readonly ICE_BURST_BYTES = 128 * 1024;
+  private static readonly MAX_MSG_BYTES = 262144; // 256KB per signaling frame
   private static readonly MAX_PASSWORD_ATTEMPTS = 5; // 5 attempts per connection
   private static readonly MAX_ROOM_AUTH_FAILURES = 50; // Global failures per room within window
   private static readonly MAX_IP_AUTH_FAILURES = 10; // Per network-bucket failures within window
@@ -77,7 +88,14 @@ export class Room {
 
     // Load password hash from storage on initialization
     this.state.blockConcurrencyWhile(async () => {
-      this.passwordHash = await this.state.storage.get<string>('passwordHash') || null;
+      try {
+        this.passwordHash = await this.state.storage.get<string>('passwordHash') || null;
+      } catch (e) {
+        // 存储读失败不得让 DO 构造期抛异常（blockConcurrencyWhile 内未捕获的
+        // 错误会毒化整个实例）：降级为无密码开放房间，下一次写会恢复真值
+        console.error('[Room] Failed to load passwordHash:', e);
+        this.passwordHash = null;
+      }
       // If there's a password, set an alarm to check for inactivity
       if (this.passwordHash) {
          await this.scheduleInactivityCheck();
@@ -176,6 +194,16 @@ export class Room {
       return;
     }
 
+    // 防夺房：设密会强制断开房间内其他所有连接（4001），若允许任意成员
+    // 执行，任何同室者都能单方面踢掉全员并独占房间。因此只允许房间内
+    // 唯一设备设密——需加密请先让所有设备离开。
+    for (const [peerId] of this.getActivePeers()) {
+      if (peerId !== attachment.id) {
+        this.sendErrorFrame(ws, 'ROOM_OCCUPIED', '房间内还有其他设备，请让所有设备离开后再设置密码');
+        return;
+      }
+    }
+
     const body = msg.data as { passwordHash?: string };
     // 严格格式：64 位十六进制（SHA-256）
     if (!body?.passwordHash || typeof body.passwordHash !== 'string' || !/^[a-f0-9]{64}$/i.test(body.passwordHash)) {
@@ -229,9 +257,13 @@ export class Room {
     // Generate challenge nonce
     const nonce = crypto.randomUUID();
 
+    // 连接级 ID：限流状态 Maps 的键（避免以 WebSocket 对象为键的强引用）
+    const connId = crypto.randomUUID();
+
     // Initialize attachment with isAuthenticated: false if password is set
     // If no password, they are implicitly authenticated
     server.serializeAttachment({
+      connId,
       isAuthenticated: this.passwordHash === null,
       authChallenge: nonce,
       authAttempts: 0,
@@ -239,7 +271,7 @@ export class Room {
     });
 
     // Initialize rate limiter for this connection
-    this.messageRateLimits.set(server, { count: 0, lastReset: Date.now() });
+    this.messageRateLimits.set(connId, { count: 0, lastReset: Date.now() });
 
     // If password is required, send challenge immediately (携带房间号：
     // 无本地密码的客户端需要它来引导输入密码，自动分配房间此前拿不到 roomCode)
@@ -292,44 +324,50 @@ export class Room {
    */
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
     try {
-      const data = typeof message === 'string' ? message : new TextDecoder().decode(message);
-
-      // 1. Message Size Validation (Basic DoS protection)
-      if (data.length > 262144) { 
+      // 1. Message Size Validation (Basic DoS protection)——校验前置：
+      //    二进制帧直接按 byteLength 判断字节数，不再先全量解码超大帧
+      //    （旧实现 decode 完才查，且 string.length 是 UTF-16 长度非字节）
+      const frameBytes = typeof message === 'string' ? message.length : message.byteLength;
+      if (frameBytes > Room.MAX_MSG_BYTES) {
          this.sendErrorFrame(ws, 'MESSAGE_TOO_LARGE', 'Message exceeds size limit (256KB)');
          return;
       }
 
+      const data = typeof message === 'string' ? message : new TextDecoder().decode(message);
+
       const msg: SignalingMessage = JSON.parse(data);
 
+      // attachment 提前解析：限流状态以 connId（字符串）为键，避免持有 WS 引用
+      const attachment = ws.deserializeAttachment() as PeerAttachment | null;
+      const connId = attachment?.connId || '';
+
       // 2. Typed rate limiting:
-      //    - relay-data / ice-candidate: byte-based token bucket (2MB/s) so file
-      //      chunks and ICE candidates are NOT starved by the control limiter
+      //    - relay-data: byte-based token bucket (2MB/s)——分块丢弃由 ACK/重传自愈
+      //    - ice-candidate: 独立 64KB/s 预算，文件洪灌不挤占 P2P 协商
       //    - all other (control) messages: low per-connection message quota,
       //      exceeded -> identifiable error frame instead of silent drop
-      if (msg.type === 'relay-data' || msg.type === 'ice-candidate') {
-        if (!this.consumeRelayBudget(ws, data.length)) {
-          if (msg.type === 'ice-candidate') {
-            // ICE 候选被丢会伤 P2P 协商，明确告知
-            this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', 'ICE candidate 发送过快');
-          } else {
-            // 分块丢弃由 ACK/重传自愈；限频告警（每秒最多一条）
-            const now = Date.now();
-            const lastWarn = this.relayDropWarn.get(ws) || 0;
-            if (now - lastWarn > 1000) {
-              this.relayDropWarn.set(ws, now);
-              this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', '中继数据超速，部分分块已丢弃（将自动重传）');
-            }
+      if (msg.type === 'relay-data') {
+        if (connId && !this.consumeBudget(this.relayByteBudget, connId, frameBytes, Room.RELAY_BYTES_PER_SEC, Room.RELAY_BURST_BYTES)) {
+          // 限频告警（每秒最多一条）
+          const now = Date.now();
+          const lastWarn = this.relayDropWarn.get(connId) || 0;
+          if (now - lastWarn > 1000) {
+            this.relayDropWarn.set(connId, now);
+            this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', '中继数据超速，部分分块已丢弃（将自动重传）');
           }
           return;
         }
-      } else if (this.isRateLimited(ws)) {
+      } else if (msg.type === 'ice-candidate') {
+        if (connId && !this.consumeBudget(this.iceByteBudget, connId, frameBytes, Room.ICE_BYTES_PER_SEC, Room.ICE_BURST_BYTES)) {
+          // ICE 候选被丢会伤 P2P 协商，明确告知
+          this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', 'ICE candidate 发送过快');
+          return;
+        }
+      } else if (connId && this.isRateLimited(connId)) {
         this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', '消息发送过快，请稍后重试');
         return;
       }
 
-      // Check authentication
-      const attachment = ws.deserializeAttachment() as PeerAttachment | null;
       // If room has password and user is not authenticated yet
       if (this.passwordHash !== null) {
         const isAuthenticated = attachment?.isAuthenticated === true;
@@ -431,15 +469,15 @@ export class Room {
   }
 
   /**
-   * Check if WebSocket is rate limited (control messages only)
+   * Check if connection is rate limited (control messages only)
    */
-  private isRateLimited(ws: WebSocket): boolean {
-    let limit = this.messageRateLimits.get(ws);
+  private isRateLimited(connId: string): boolean {
+    let limit = this.messageRateLimits.get(connId);
     const now = Date.now();
 
     if (!limit) {
       limit = { count: 0, lastReset: now };
-      this.messageRateLimits.set(ws, limit);
+      this.messageRateLimits.set(connId, limit);
     }
 
     if (now - limit.lastReset > Room.RATE_LIMIT_WINDOW) {
@@ -458,22 +496,23 @@ export class Room {
   }
 
   /**
-   * Byte-based token bucket for data-heavy messages (relay chunks, ICE candidates)
-   * Allows ~2MB/s sustained with 4MB burst - file chunks recover from drops via
-   * the ACK/retransmission protocol, so silent drop is safe here.
+   * Generic byte-based token bucket for data-heavy message types (relay chunks,
+   * ICE candidates - each with its own store so a 2MB/s file flood cannot
+   * starve P2P negotiation). Silent drop is safe: the ACK/retransmission
+   * protocol recovers relay chunks.
    */
-  private consumeRelayBudget(ws: WebSocket, bytes: number): boolean {
+  private consumeBudget(store: Map<string, { tokens: number; lastRefill: number }>, connId: string, bytes: number, bytesPerSec: number, burstBytes: number): boolean {
     const now = Date.now();
-    let budget = this.relayByteBudget.get(ws);
+    let budget = store.get(connId);
 
     if (!budget) {
-      budget = { tokens: Room.RELAY_BURST_BYTES, lastRefill: now };
-      this.relayByteBudget.set(ws, budget);
+      budget = { tokens: burstBytes, lastRefill: now };
+      store.set(connId, budget);
     }
 
     // Refill based on elapsed time
     const elapsed = (now - budget.lastRefill) / 1000;
-    budget.tokens = Math.min(Room.RELAY_BURST_BYTES, budget.tokens + elapsed * Room.RELAY_BYTES_PER_SEC);
+    budget.tokens = Math.min(burstBytes, budget.tokens + elapsed * bytesPerSec);
     budget.lastRefill = now;
 
     if (budget.tokens < bytes) {
@@ -526,32 +565,6 @@ export class Room {
         return;
       }
 
-      // Global room-level brute-force protection (survives reconnects - the
-      // per-connection counter alone is trivially bypassed by reconnecting)
-      const now = Date.now();
-      const storedFailures = await this.state.storage.get<{ count: number; windowStart: number }>('authFailures');
-      const failures = storedFailures && (now - storedFailures.windowStart) < Room.AUTH_FAILURE_WINDOW
-        ? storedFailures
-        : { count: 0, windowStart: now };
-
-      if (failures.count >= Room.MAX_ROOM_AUTH_FAILURES) {
-        this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', '尝试次数过多，请稍后再试');
-        try { ws.close(4002, 'RATE_LIMIT_EXCEEDED'); } catch (e) { /* ignore */ }
-        return;
-      }
-
-      // Per-network-bucket brute-force protection（CF-Connecting-IP 网段桶，
-      // 换连接/换 IPv6 临时地址都无法绕过；分布式换网段由全局计数兑底）
-      const clientBucket = attachment?.clientBucket || '';
-      if (clientBucket) {
-        const bucketFailures = await this.getBucketAuthFailures(clientBucket);
-        if (bucketFailures.count >= Room.MAX_IP_AUTH_FAILURES) {
-          this.sendErrorFrame(ws, 'RATE_LIMIT_EXCEEDED', '尝试次数过多，请稍后再试');
-          try { ws.close(4002, 'RATE_LIMIT_EXCEEDED'); } catch (e) { /* ignore */ }
-          return;
-        }
-      }
-
       const authData = msg.data as { response: string };
       const expectedNonce = attachment?.authChallenge;
 
@@ -561,6 +574,10 @@ export class Room {
       }
 
       // Verify response = SHA256(passwordHash + nonce)
+      // 先验证口令，再参考全局/网段失败计数：限流只针对错误尝试。
+      // 旧实现先查限流就直接关连接，攻击者用错误尝试烧尽预算即可让
+      // 持正确口令的房主永久进不了房（锁房 DoS）。digest 是纯内存计算，
+      // 放在限流检查之前没有成本问题。
       const encoder = new TextEncoder();
       const data = encoder.encode(this.passwordHash + expectedNonce);
       const hashBuffer = await crypto.subtle.digest('SHA-256', data);
@@ -574,6 +591,7 @@ export class Room {
         await this.state.storage.delete('authFailures');
 
         // Reset per-bucket failure counter
+        const clientBucket = attachment?.clientBucket || '';
         if (clientBucket) {
           await this.clearBucketAuthFailures(clientBucket);
         }
@@ -594,15 +612,30 @@ export class Room {
         // Authentication failed - increment attempts
         const newAttempts = attempts + 1;
         const newNonce = crypto.randomUUID();
+        const clientBucket = attachment?.clientBucket || '';
 
-        // 失败窗口：只在窗口过期时重置起点；失败只累加计数。
-        // （若每次失败都重置 windowStart，攻击者每 9 分钟失败一次即可永久锁房）
-        failures.count += 1;
-        await this.state.storage.put('authFailures', failures);
+        // 全局失败计数：窗口起点只在过期重建时更新，失败只累加计数。
+        // （若每次失败都重置 windowStart，攻击者可永久锁房）
+        // 预算耗尽后不再写入（防存储写放大），失败尝试改由断连节流。
+        const now = Date.now();
+        const storedFailures = await this.state.storage.get<{ count: number; windowStart: number }>('authFailures');
+        const failures = storedFailures && (now - storedFailures.windowStart) < Room.AUTH_FAILURE_WINDOW
+          ? storedFailures
+          : { count: 0, windowStart: now };
+        if (failures.count < Room.MAX_ROOM_AUTH_FAILURES) {
+          failures.count += 1;
+          await this.state.storage.put('authFailures', failures);
+        }
 
-        // Increment per-bucket failure counter
+        // Per-network-bucket failure counter（CF-Connecting-IP 网段桶，
+        // 换连接/换 IPv6 临时地址都无法绕过；分布式换网段由全局计数兜底）
+        let bucketCount = 0;
         if (clientBucket) {
-          await this.incrementBucketAuthFailures(clientBucket);
+          const bucketFailures = await this.getBucketAuthFailures(clientBucket);
+          bucketCount = bucketFailures.count;
+          if (bucketCount < Room.MAX_IP_AUTH_FAILURES) {
+            await this.incrementBucketAuthFailures(clientBucket);
+          }
         }
 
         ws.serializeAttachment({
@@ -618,8 +651,11 @@ export class Room {
           data: { nonce: newNonce } // Send new nonce for retry
         }));
 
-        // If max attempts reached, close
-        if (newAttempts >= Room.MAX_PASSWORD_ATTEMPTS) {
+        // 断连条件：本连接烧穿 5 次，或房间/网段预算已耗尽（每连接最多
+        // 再试一次）。只作用于错误尝试——正确口令在上方分支永远放行。
+        const globalExhausted = failures.count >= Room.MAX_ROOM_AUTH_FAILURES;
+        const bucketExhausted = clientBucket !== '' && bucketCount >= Room.MAX_IP_AUTH_FAILURES;
+        if (newAttempts >= Room.MAX_PASSWORD_ATTEMPTS || globalExhausted || bucketExhausted) {
           try { ws.close(4002, 'RATE_LIMIT_EXCEEDED'); } catch (e) { /* ignore */ }
         }
       }
@@ -627,27 +663,22 @@ export class Room {
   }
 
   /**
-   * 剔除该连接在 peerWsCache 中的条目（close/error 共用）
+   * 删除该连接的全部限流状态（close/error 共用；以 connId 为键，不留 WS 引用）
    */
-  private prunePeerCacheEntry(ws: WebSocket): void {
-    if (this.peerWsCache) {
-      const attachment = ws.deserializeAttachment() as PeerAttachment | null;
-      if (attachment?.id && this.peerWsCache.get(attachment.id) === ws) {
-        this.peerWsCache.delete(attachment.id);
-      }
-    }
+  private clearConnState(ws: WebSocket): void {
+    const connId = (ws.deserializeAttachment() as PeerAttachment | null)?.connId;
+    if (!connId) return;
+    this.messageRateLimits.delete(connId);
+    this.relayByteBudget.delete(connId);
+    this.iceByteBudget.delete(connId);
+    this.relayDropWarn.delete(connId);
   }
 
   /**
    * WebSocket close handler (Hibernation API)
    */
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
-    this.messageRateLimits.delete(ws);
-    this.relayByteBudget.delete(ws);
-    this.relayDropWarn.delete(ws);
-
-    // Prune the cache entry for this connection
-    this.prunePeerCacheEntry(ws);
+    this.clearConnState(ws);
 
     await this.handleLeave(ws);
   }
@@ -658,13 +689,7 @@ export class Room {
    * peer-left，避免幽灵设备卡片；用 WeakSet 去重防止 close+error 双广播。
    */
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
-    this.messageRateLimits.delete(ws);
-    this.relayByteBudget.delete(ws);
-    this.relayDropWarn.delete(ws);
-
-    // 与 close 对称：error-only 断线同样要清缓存，否则失效 WS 一直留在
-    // peerWsCache 里被广播遍历（休眠重建前不会消失）
-    this.prunePeerCacheEntry(ws);
+    this.clearConnState(ws);
 
     await this.handleLeave(ws);
   }
@@ -699,8 +724,10 @@ export class Room {
     const tags = this.state.getTags(ws);
     const roomCode = tags.length > 0 ? tags[0] : '';
 
-    // Create peer attachment data
+    // Create peer attachment data（继承旧附件的 connId/clientBucket 等连接级
+    // 字段，限流状态清理依赖 connId；作废旧会话残留的 challenge/attempts）
     const attachment: PeerAttachment = {
+      ...(oldAttachment || {}),
       id: peerId,
       name: sanitizedName,
       deviceType: ['mobile', 'tablet'].includes(joinData.deviceType) ? joinData.deviceType : 'desktop',
@@ -708,17 +735,11 @@ export class Room {
       deviceKey: this.sanitizeString(joinData.deviceKey || '', 500), // 设备身份公钥（SPKI base64）
       isAuthenticated: true, // If they reached here, they are authenticated (or no password required)
       joinedAt: Date.now(),
+      authChallenge: undefined,
+      authAttempts: undefined,
     };
 
-    // 先更新附件，再同步缓存（休眠唤醒后缓存为 null 时从最新附件重建，
-    // 旧 peerId 自然不在缓存中，不会留下脏条目）
     ws.serializeAttachment(attachment);
-    if (!this.peerWsCache) {
-      this.rebuildPeerCache();
-    } else {
-      if (oldId) this.peerWsCache.delete(oldId);
-      this.peerWsCache.set(peerId, ws);
-    }
 
     // 重复 join：通知其他设备旧 ID 已离开
     if (oldId) {
@@ -803,24 +824,16 @@ export class Room {
   }
 
   /**
-   * Rebuild the peerId -> WebSocket cache from hibernation state
-   */
-  private rebuildPeerCache(): void {
-    this.peerWsCache = new Map();
-    for (const ws of this.state.getWebSockets()) {
-      const attachment = ws.deserializeAttachment() as PeerAttachment | null;
-      if (attachment?.id) {
-        this.peerWsCache.set(attachment.id, ws);
-      }
-    }
-  }
-
-  /**
-   * Get the WebSocket for a peer ID using the cache (lazy rebuild on wake)
+   * Find the OPEN WebSocket for a peer ID by scanning hibernation-safe
+   * attachments (no per-socket object retention in class state, AGENTS §3)
    */
   private getPeerWs(peerId: string): WebSocket | undefined {
-    if (!this.peerWsCache) this.rebuildPeerCache();
-    return this.peerWsCache?.get(peerId);
+    for (const ws of this.state.getWebSockets()) {
+      if (ws.readyState !== WS_READY_STATE.OPEN) continue;
+      const attachment = ws.deserializeAttachment() as PeerAttachment | null;
+      if (attachment?.id === peerId) return ws;
+    }
+    return undefined;
   }
 
   /**
@@ -913,17 +926,17 @@ export class Room {
   }
 
   /**
-   * Broadcast message to all peers except excluded one (uses the cache)
+   * Broadcast message to all JOINED peers except the excluded one.
+   * Scans getWebSockets() directly - never retains socket references.
    */
   private broadcast(msg: SignalingMessage, excludePeerId?: string): void {
     const message = JSON.stringify(msg);
-    if (!this.peerWsCache) this.rebuildPeerCache();
-
-    for (const [peerId, targetWs] of this.peerWsCache!.entries()) {
-      if (peerId === excludePeerId) continue;
+    for (const targetWs of this.state.getWebSockets()) {
+      if (targetWs.readyState !== WS_READY_STATE.OPEN) continue;
+      const attachment = targetWs.deserializeAttachment() as PeerAttachment | null;
+      if (!attachment?.id || attachment.id === excludePeerId) continue;
 
       try {
-        // Try to send regardless of readyState - let the send fail if connection is bad
         targetWs.send(message);
       } catch (e) {
         // Silently ignore send failures - peer may have disconnected

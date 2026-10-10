@@ -57,13 +57,14 @@ const main = async () => {
 
   await new Promise((r) => setTimeout(r, 3300)); // 设密在场要求 >3s
   A.send(JSON.stringify({ type: 'set-password', data: { passwordHash: HASH } }));
-  const sp = await A._wait((m) => m?.type === 'set-password-result');
-  check('A 设密收到 success 回执', sp.success === true, JSON.stringify(sp));
+  const occupied = await A._wait((m) => m?.type === 'error' && m.error === 'ROOM_OCCUPIED');
+  check('有他人在场时设密被拒（防夺房 ROOM_OCCUPIED）', !!occupied);
 
-  const locked = await E._wait((m) => m?.type === 'room-locked');
-  check('在场成员 E 收到 room-locked', !!locked);
-  const eCode = await E._waitClosed();
-  check('E 被以 4001 强制撤权', eCode === 4001, 'code=' + eCode);
+  E.close();
+  await new Promise((r) => setTimeout(r, 800)); // 等待服务端处理 E 的离开
+  A.send(JSON.stringify({ type: 'set-password', data: { passwordHash: HASH } }));
+  const sp = await A._wait((m) => m?.type === 'set-password-result');
+  check('清场后 A 设密收到 success 回执', sp.success === true, JSON.stringify(sp));
 
   const B = await open();
   const ch = await B._wait((m) => m?.type === 'challenge');

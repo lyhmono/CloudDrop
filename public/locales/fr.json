@@ -182,6 +182,7 @@
     "creatingSecure": "Création du salon sécurisé…",
     "createSecureFailed": "Échec de la création du salon sécurisé",
     "alreadyTakenByOther": "Ce salon est déjà chiffré. Saisissez son mot de passe pour le rejoindre.",
+    "secureRoomOccupied": "D'autres appareils sont encore dans le salon. Faites-les quitter avant de définir un mot de passe.",
     "createSuccess": "Salle chiffrée créée avec succès",
     "secureSessionRestored": "Salon chiffré rejoint avec le mot de passe mémorisé pour cette session",
     "passwordError": "Mot de passe incorrect",

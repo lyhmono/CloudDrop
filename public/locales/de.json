@@ -182,6 +182,7 @@
     "creatingSecure": "Sicherer Raum wird erstellt…",
     "createSecureFailed": "Sicherer Raum konnte nicht erstellt werden",
     "alreadyTakenByOther": "Dieser Raum ist bereits verschlüsselt. Gib das Passwort ein, um beizutreten.",
+    "secureRoomOccupied": "Es sind noch andere Geräte im Raum. Alle müssen den Raum verlassen, bevor ein Passwort gesetzt werden kann.",
     "createSuccess": "Verschlüsselter Raum erfolgreich erstellt",
     "secureSessionRestored": "Mit dem für diese Sitzung gespeicherten Passwort wieder im verschlüsselten Raum",
     "passwordError": "Passwort falsch",

@@ -66,7 +66,8 @@ export const deviceIcons = {
 export function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
-  return div.innerHTML;
+  // innerHTML 序列化不转义引号——调用点若进属性插值会被截断，显式补上
+  return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 /** 文件名清洗：剥路径与控制字符（peer 可控展示/下载名，防钓鱼与换行注入） */
@@ -83,6 +84,7 @@ export function basename(name) {
 
 // Format file size
 export function formatFileSize(bytes) {
+  if (!Number.isFinite(bytes)) return '—'; // Infinity/NaN：首块 elapsed=0 等边界不能渲染出 "NaN undefined"
   if (bytes === 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB'];
   const k = 1024;
@@ -92,6 +94,7 @@ export function formatFileSize(bytes) {
 
 // Format speed
 export function formatSpeed(bps) {
+  if (!Number.isFinite(bps)) return '—';
   if (bps === 0) return '0 B/s';
   const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
   const k = 1024;

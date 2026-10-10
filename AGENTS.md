@@ -96,9 +96,9 @@ This guide summarizes the project, commands, coding standards, and architectural
 ### 1. Project Structure
 - `src/index.ts`: **The Router**.
     - Handles incoming HTTP requests.
-    - Generates Room IDs based on Client IP hashing (SHA-256).
+    - Generates Room IDs based on Client IP hashing (SHA-256, salted with `ROOM_SALT`).
     - Routes `/ws` requests to the specific `Room` Durable Object stub.
-    - Handles static API endpoints (e.g., `/api/room-id`, `/api/ice-servers`).
+    - Handles API endpoints (`/api/ice-servers`, `/api/room/check-password`).
 - `src/room.ts`: **The State Machine**.
     - Implements the `DurableObject` interface.
     - Manages the WebSocket lifecycle.
@@ -113,11 +113,9 @@ This guide summarizes the project, commands, coding standards, and architectural
     - `js/config.js` centralizes constants (timeouts, chunk sizes, feature flags, API URLs).
 
 ### 2. Key HTTP Endpoints
-- `GET /api/room-id`: returns a hashed room id derived from client IP.
 - `GET /api/ice-servers`: returns STUN-only defaults or TURN credentials if configured.
-- `POST /api/room/set-password?room=XXXXXX`: stores `passwordHash` in the room DO.
 - `GET /api/room/check-password?room=XXXXXX`: returns whether room has a password.
-- `GET /ws`: WebSocket upgrade, routed to a room DO based on room code.
+- `GET /ws`: WebSocket upgrade, routed to a room DO based on room code. An explicit but malformed `?room=` is rejected with `400` (no silent fallback to the IP-derived room); with no `room` param the room is auto-assigned from the salted client /24 (or /64) hash. Password setting is a WebSocket message (`set-password`), not HTTP.
 
 ### 3. Durable Objects & WebSocket Hibernation
 This project uses the **WebSocket Hibernation API** for high performance and lower costs. Agents must follow these specific patterns:
@@ -143,9 +141,9 @@ The signaling logic handles WebRTC coordination. New message types should be add
 ### 5. WebSocket Message Types (Room)
 - `join`, `peer-joined`, `peer-left`, `name-changed`
 - `offer`, `answer`, `ice-candidate`
-- `text`, `relay-data`, `key-exchange`
+- `relay-data`, `key-exchange` (chat `text` travels inside `relay-data`/DataChannel, not as a Room message)
 - `file-request`, `file-response`, `file-cancel`
-- `challenge`, `auth`, `auth-success`
+- `challenge`, `auth`, `auth-success`, `room-locked`, `set-password`, `set-password-result`, `error`
 
 ### 6. Signaling Message Shapes (Client <-> Room)
 Use these payload shapes when sending or handling signaling messages.
@@ -216,9 +214,11 @@ P2P data channel messages are JSON strings plus binary chunks. Relay data wraps 
 
 ### 9. Password + Auth Flow
 - Room password is stored as `passwordHash` in DO storage and guarded by an inactivity alarm.
+- `set-password` requires: joined peer (peerId), minimum presence (`ROOM_CLAIM_MIN_PRESENCE`), and that the requester is the **only** active peer — locking an occupied room would kick every member, which any member could abuse to seize the room (`ROOM_OCCUPIED` is returned otherwise).
 - New connections receive a `challenge` nonce and must respond with `auth` using `SHA256(passwordHash + nonce)`.
 - Successful auth clears the inactivity alarm and marks the WebSocket attachment `isAuthenticated`.
 - Failed auth increments per-connection attempts and closes after `MAX_PASSWORD_ATTEMPTS`.
+- Rate limiting (global + per-network-bucket failure budgets) only throttles **incorrect** attempts: the credential is verified before consulting budgets, so a correct password is never rejected by attacker-burned counters (anti lock-out DoS). Exhausted budgets additionally stop storage writes (one connect = one wasted guess).
 
 ### 10. Room Lifecycle + Alarms
 - Secure rooms use a TTL alarm (`SECURE_ROOM_TTL`) to clear `passwordHash` after inactivity.
@@ -229,7 +229,7 @@ Room IDs are deterministic based on the client's network to facilitate P2P disco
 - **IPv4**: First 3 octets (/24 subnet).
 - **IPv6**: First 64 bits (/64 prefix).
 - **Logic**: Located in `generateRoomId` in `src/index.ts`.
-- **Privacy**: The network part is hashed (SHA-256) before use; actual IPs are not exposed in the room ID.
+- **Privacy**: The network part is hashed (SHA-256) with server-side `ROOM_SALT` before use; actual IPs are not exposed in the room ID. **Production deployments must set `wrangler secret put ROOM_SALT`** — unsalted 6-hex codes are offline-reversible to a /24 (only ~16.7M IPv4 /24s exist).
 
 ## Security Rules
 

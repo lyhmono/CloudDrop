@@ -182,6 +182,7 @@
     "creatingSecure": "Creando sala segura…",
     "createSecureFailed": "No se pudo crear la sala segura",
     "alreadyTakenByOther": "Esta sala ya está cifrada. Introduce su contraseña para unirte.",
+    "secureRoomOccupied": "Aún hay otros dispositivos en la sala. Pide a todos que salgan antes de establecer una contraseña.",
     "createSuccess": "Sala cifrada creada exitosamente",
     "secureSessionRestored": "Te has reincorporado a la sala cifrada con la contraseña recordada en esta sesión",
     "passwordError": "Contraseña incorrecta",
