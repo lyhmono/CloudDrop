@@ -141,6 +141,16 @@ npx wrangler secret put TURN_KEY_API_TOKEN
 
 Without TURN configuration, CloudDrop will use public STUN servers for WebRTC connection.
 
+### Recommended: ROOM_SALT (auto room code privacy)
+
+Auto-assigned room codes are derived from a hash of the client's /24 (IPv4) or /64 (IPv6) subnet. **Production deployments should set a server-side salt**, otherwise auto room codes can be brute-forced offline to reveal the owner's subnet:
+
+```bash
+npx wrangler secret put ROOM_SALT   # any long random value, e.g. openssl rand -hex 32
+```
+
+After setting it, auto room codes change once (same-subnet devices move to a new auto room automatically - no action needed; explicitly shared room codes and secure rooms are unaffected). Without the salt, the Worker logs a continuous security warning.
+
 ## 📁 Project Structure
 
 ```

@@ -141,6 +141,16 @@ npx wrangler secret put TURN_KEY_API_TOKEN
 
 未配置 TURN 时，CloudDrop 将使用公共 STUN 服务器进行 WebRTC 连接。
 
+### 推荐：ROOM_SALT（自动房间号隐私防护）
+
+同网段自动房间号由客户端 /24（IPv4）或 /64（IPv6）网段哈希截取生成。**生产部署强烈建议设置服务端盐**，否则自动房号可被离线穷举反推出持有者的网段：
+
+```bash
+npx wrangler secret put ROOM_SALT   # 值为任意长随机串，如 openssl rand -hex 32
+```
+
+设置后自动房号会变化一次（同网段设备自动进新房，无需任何操作；分享房号进入的房间与加密房间不受影响）。未设置时 Worker 日志会持续输出安全告警提示。
+
 ## 📁 项目结构
 
 ```
