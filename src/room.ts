@@ -698,7 +698,8 @@ export class Room {
    * Sanitize string input (truncate to max length)
    */
   private sanitizeString(str: string, maxLength: number): string {
-    if (!str) return '';
+    // 非字符串（number/object 等畸形消息字段）直接归零，避免 .replace 抛错
+    if (typeof str !== 'string' || !str) return '';
     // 剥离控制字符与 Bidi 覆盖符（设备名/浏览器信息会被展示，防 UI 与终端欺骗）
     return str
       .replace(/[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '')
@@ -910,7 +911,7 @@ export class Room {
   }
 
   /**
-   * Send message to a specific peer by ID (uses the peerId -> ws cache)
+   * Send message to a specific peer by ID (resolves socket via attachment scan)
    */
   private sendToPeer(targetPeerId: string, message: object): boolean {
     const targetWs = this.getPeerWs(targetPeerId);
